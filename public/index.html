@@ -5,8 +5,131 @@
     <meta http-equiv="X-UA-Compatible" content="IE=edge">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Rust search engine</title>
+    <style>
+        * {
+            box-sizing: border-box;
+        }
+        :root {
+            --background-color: #f2f2f2;
+            --secondary-background-color: #e6e6e6;
+            --teritary-background-color: #d9d9d9;
+            --accent-color: #29bd29;
+            --text-color: #000000;
+            --innerSize: 400px;
+        }
+        html {
+            height: 100%;
+            margin: 0;
+            padding: 0;
+        }
+        body {
+            font-family: Arial, Helvetica, sans-serif;
+            background-color: var(--background-color);
+            color: var(--text-color);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            --border: 4px;
+            height: calc(100% - var(--border) * 2);
+            margin: 0;
+            padding: 0;
+            border: var(--border) solid var(--accent-color);
+        }
+        .input {
+            width: 100%;
+            height: 50px;
+            font-size: 45px;
+            border: none;
+            border-bottom: 2px solid var(--accent-color);
+            outline: none;
+            position: absolute;
+            background-color: var(--secondary-background-color);
+            transition: all 0.2s ease-in-out;
+            z-index: 10;
+        }
+        .input:focus {
+            transform: translate(0, calc(var(--innerSize) / -2));
+            border-bottom: none;
+            border-left: 2px solid var(--accent-color);
+        }
+        .recommended {
+            position: absolute;
+            top: 0;
+            left: 0;
+            opacity: 0;
+            width: 100%;
+            height: calc(var(--innerSize) - 50px);
+            background-color: var(--secondary-background-color);
+            transform: translateY(-50%);
+            z-index: 1;
+            transition: all 0.2s ease-in-out;
+            border-left: 2px solid var(--accent-color);
+        }
+        .search:focus-within .recommended {
+            opacity: 1;
+            transform: translateY(calc(-50% + 50px));
+        }
+        .search {
+            position: relative;
+            
+            width: calc(100vw - 100px);
+            max-width: 1000px;
+        }
+        .recommended-item {
+            width: calc(100% - 20px);
+            height: 50px;
+            font-size: 30px;
+            padding: 10px;
+            margin: 10px;
+            background-color: var(--teritary-background-color);
+            border: 0px solid var(--accent-color);
+            border-right: 2px solid var(--accent-color);
+            transition: all 0.2s ease-in-out;
+        }
+        .recommended-item:hover {
+            border: 2px solid var(--accent-color);
+        }
+    </style>
 </head>
 <body>
-    If you can see this, Rocket works!
+    <div class="search">
+        <input class="input" type="text" placeholder="Search query" id="search" oninput="updateRecommended(this.value)">
+        <div class="recommended" id="recommended"></div>
+    </div>
+    <script>
+        document.onkeydown = checkSearch;
+        function checkSearch(e) {
+            if (e.key === "Enter") {
+                search(document.getElementById("search").value);
+            }
+        }
+        function search(query) {
+            window.location.href = "/search?q=" + query;
+        }
+        function updateRecommended(query) {
+            // Send a request to the server to get recommended search terms
+            let path = "/api/recommended?query=" + query;
+            let request = new XMLHttpRequest();
+            request.open("GET", path);
+            request.send();
+
+            request.onload = function() {
+                if (request.status == 200) {
+                    let recommended = document.getElementById("recommended");
+                    recommended.innerHTML = "";
+                    let data = JSON.parse(request.responseText);
+                    for (let i = 0; i < data.length; i++) {
+                        let item = document.createElement("div");
+                        item.innerHTML = data[i].text;
+                        item.onclick = function() {
+                            search(data[i].text);
+                        }
+                        item.classList.add("recommended-item");
+                        recommended.appendChild(item);
+                    }
+                }
+            }
+        }
+    </script>
 </body>
 </html>
