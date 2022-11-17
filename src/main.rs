@@ -19,7 +19,7 @@ impl Recommendation<String> {
 
 use rocket_db_pools::sqlx::pool::PoolConnection;
 use rocket_db_pools::{Database};
-use rocket_db_pools::sqlx::{self, Sqlite};
+use rocket_db_pools::sqlx::{self, Sqlite, Row};
 
 #[derive(Database)]
 #[database("sites")]
@@ -55,22 +55,66 @@ async fn main() {
             let mut connection: PoolConnection<Sqlite> = db.acquire().await.unwrap();
         
             // First, get the database connection from rocket.
-            // Then, check if the staging table exists.
+            // Then, make sure the staging table exists.
         
-            let staging_table_exists = sqlx::query("SELECT name FROM sqlite_master WHERE type='table' AND name='staging';")
-                .fetch_one(&mut connection)
+            sqlx::query("CREATE TABLE IF NOT EXISTS staging (url TEXT PRIMARY KEY);")
+                .execute(&mut connection)
                 .await
-                .is_ok();
-        
-            if !staging_table_exists {
-                println!("Staging table doesn't exist. Creating it now.");
-                sqlx::query("CREATE TABLE staging (url TEXT PRIMARY KEY);")
+                .unwrap();
+            println!("Staging table created if it didn't exist.");
+
+            // Create the sitedata table if it doesn't exist.
+            // This table has a url (text) as the primary key, a title (text), an array of text for keywords, and a rank (integer).
+            sqlx::query("CREATE TABLE IF NOT EXISTS sitedata (url TEXT PRIMARY KEY, title TEXT, keywords TEXT[], rank INTEGER);")
+                .execute(&mut connection)
+                .await
+                .unwrap();
+            println!("Sitedata table created if it didn't exist.");
+
+            // Check if there are any sites in the sitedata table. If not, this is the first time we've started to index the web.
+            // If there are sites, then we can skip adding wikipedia to the staging table.
+            let mut rows = sqlx::query("SELECT * FROM sitedata;")
+                .fetch_all(&mut connection)
+                .await
+                .unwrap();
+
+            if rows.is_empty() {
+                // Add wikipedia to the staging table.
+                sqlx::query("INSERT INTO staging (url) VALUES (?);")
+                    .bind("https://en.wikipedia.org/wiki/Main_Page")
                     .execute(&mut connection)
                     .await
                     .unwrap();
-            } else {
-                println!("Staging table exists.");
+                println!("Added wikipedia to the staging table.");
             }
+
+            // Awesome! We can start indexing the web.
+            index_staged_sites(connection).await;
         })))
         .launch().await;
+}
+
+async fn index_staged_sites(mut connection: PoolConnection<Sqlite>) {
+    // Get the first 100 sites from the staging table and remove them from the staging table.
+    // Then, index them.
+    let rows = sqlx::query("SELECT * FROM staging LIMIT 100;")
+        .fetch_all(&mut connection)
+        .await
+        .unwrap();
+    
+    // Remove the sites from the staging table.
+    for row in &rows {
+        let url: String = row.get("url");
+        sqlx::query("DELETE FROM staging WHERE url = ?;")
+            .bind(url.clone())
+            .execute(&mut connection)
+            .await
+            .unwrap();
+
+        index_site(url.as_str());
+    }
+}
+
+fn index_site(url: &str) {
+    // TODO: Implement indexing
 }
