@@ -1,2 +1,31 @@
 [default]
-template_dir = "templates"
+address = "127.0.0.1"
+port = 8000
+workers = 16
+max_blocking = 512
+keep_alive = 5
+ident = "Rocket"
+log_level = "normal"
+temp_dir = "/tmp"
+cli_colors = true
+## Don't (!) use this key! Generate your own!
+secret_key = "hPRYyVRiMyxpw5sBB1XeCMN1kFsDCqKvBi2QJxBVHQk="
+
+[default.limits]
+form = "64 kB"
+json = "1 MiB"
+msgpack = "2 MiB"
+"file/jpg" = "5 MiB"
+
+# [default.tls]
+# certs = "path/to/cert-chain.pem"
+# key = "path/to/key.pem"
+
+[default.shutdown]
+ctrlc = true
+signals = ["term", "hup"]
+grace = 5
+mercy = 5
+
+[default.databases.sites]
+url = "./databases/sites.sqlite"
