@@ -14,12 +14,26 @@
         
         // Set the page title
         document.title = `Search results for "${query}"`;
+        
+        let path = "/api/search?query=" + query;
+        let request = new XMLHttpRequest();
+        request.open("GET", path);
+        request.send();
+        request.onload = function() {
+            let results = JSON.parse(request.responseText);
 
-        // Set the page content
-        document.body.innerHTML = `
-            <h1>Search results for "${query}"</h1>
-            <p>TODO: Add search results here</p>
-        `;
+            // Set the page content
+            document.body.innerHTML = `
+                <h1>Search results for "${query}"</h1>
+                <h2>Found ${results.count} results</h2>
+                ${results.sites.map(result => `
+                    <div>
+                        <h2>${result.title}</h2>
+                        <p>${result.url}</p>
+                    </div>
+                `).join('')}
+            `;
+        }
     </script>
 </body>
 </html>

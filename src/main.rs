@@ -3,6 +3,19 @@ use rocket::fairing::AdHoc;
 use rocket::fs::FileServer;
 use rocket::serde::{Serialize, json::Json};
 
+// Runs prinln!() with all the arguments if the debug flag is passed on the command line.
+// This function can take as many arguments as needed.
+
+// debugMessage! macro
+macro_rules! debugMessage {
+    ($($arg:tt)*) => {
+        // Check if the --debug flag is passed on the command line
+        if std::env::args().any(|x| x == "--debug") {
+            println!($($arg)*);
+        }
+    }
+}
+
 #[macro_use] extern crate rocket;
 
 #[cfg(test)] mod tests;
@@ -19,17 +32,50 @@ impl Recommendation<String> {
 }
 
 use rocket_db_pools::sqlx::pool::PoolConnection;
-use rocket_db_pools::{Database};
+use rocket_db_pools::sqlx::sqlite::SqliteRow;
+use rocket_db_pools::{Database, Connection};
 use rocket_db_pools::sqlx::{self, Sqlite, Row};
 
 #[derive(Database)]
 #[database("sites")]
 struct Sites(sqlx::SqlitePool);
 
-#[get("/search?<q>")]
-async fn search(/*mut db: Connection<Sites>,*/ q: i64) -> Json<Vec<String>> {
-    // TODO: Implement search
-    Json(vec![q.to_string()])
+#[derive(Serialize)]
+struct Site {
+    title: String,
+    url: String,
+}
+
+#[derive(Serialize)]
+struct SearchResults {
+    sites: Vec<Site>,
+    count: u32
+}
+
+#[get("/search?<query>")]
+async fn search(mut db: Connection<Sites>, query: String) -> Json<SearchResults> {
+    // Get sites from the database with similar titles
+    let sites: Vec<SqliteRow> = sqlx::query("SELECT title, url FROM sitedata WHERE title LIKE ? ESCAPE '\\' LIMIT 30")
+        .bind(format!("%{}%", query))
+        .fetch_all(&mut *db)
+        .await
+        .unwrap();
+
+    // Get how many sites are found
+    let count: u32 = sqlx::query("SELECT COUNT(*) FROM sitedata WHERE title LIKE ? ESCAPE '\\'")
+        .bind(format!("%{}%", query))
+        .fetch_one(&mut *db)
+        .await
+        .unwrap()
+        .get(0);
+
+    let sites_data: Vec<Site> = sites.iter().map(|site| {
+        let title: String = site.try_get::<&str, &str>("title").unwrap_or("Unknown").to_string();
+        let url: String = site.try_get::<&str, &str>("url").unwrap_or("Unknown").to_string();
+        Site { title, url }
+    }).collect();
+
+    Json(SearchResults { sites: sites_data, count })
 }
 
 #[get("/recommended?<query>")]
@@ -70,7 +116,7 @@ async fn index_web(mut connection: PoolConnection<Sqlite>) {
         .execute(&mut connection)
         .await
         .unwrap();
-    println!("Staging table created if it didn't exist.");
+    debugMessage!("Staging table created if it didn't exist.");
 
     // Create the sitedata table if it doesn't exist.
     // This table has a url (text) as the primary key, a title (text), an array of text for keywords, and a rank (integer).
@@ -78,7 +124,7 @@ async fn index_web(mut connection: PoolConnection<Sqlite>) {
         .execute(&mut connection)
         .await
         .unwrap();
-    println!("Sitedata table created if it didn't exist.");
+    debugMessage!("Sitedata table created if it didn't exist.");
 
     // Check if there are any sites in the sitedata table. If not, this is the first time we've started to index the web.
     // If there are sites, then we can skip adding wikipedia to the staging table.
@@ -94,7 +140,7 @@ async fn index_web(mut connection: PoolConnection<Sqlite>) {
             .execute(&mut connection)
             .await
             .unwrap();
-        println!("Added wikipedia to the staging table.");
+        debugMessage!("Added wikipedia to the staging table.");
     }
 
     // Awesome! We can start indexing the web.
@@ -115,7 +161,7 @@ async fn index_staged_sites(mut connection: PoolConnection<Sqlite>) {
         // Remove the sites from the staging table.
         for row in &rows {
             let url: String = row.get("url");
-            println!("{}", url);
+            debugMessage!("{}", url);
             // Make sure we don't move connection so it can be used in the next iteration of the loop.
             sqlx::query("DELETE FROM staging WHERE url = ?;")
                 .bind(url.clone())
@@ -123,10 +169,14 @@ async fn index_staged_sites(mut connection: PoolConnection<Sqlite>) {
                 .await
                 .unwrap();
 
-            println!("Removed {} from the staging table.", url);
+            debugMessage!("Removed {} from the staging table.", url);
 
             index_site(url.as_str(), &mut connection).await;
+
+            debugMessage!("Indexed {}.", url);
         }
+
+        debugMessage!("Finished indexing set of 100 staged sites.");
 
         // Check if there are any more sites in the staging table.
         rows = sqlx::query("SELECT * FROM staging LIMIT 100;")
@@ -135,6 +185,7 @@ async fn index_staged_sites(mut connection: PoolConnection<Sqlite>) {
             .unwrap();
         
         if rows.is_empty() {
+            debugMessage!("No more sites in the staging table.");
             are_staged_sites = false;
         }
     }
@@ -143,29 +194,31 @@ async fn index_staged_sites(mut connection: PoolConnection<Sqlite>) {
     println!("Done indexing the web! This probably shouldn't have been called unless this was left running for a rediculous amount of time or something went wrong.");
 }
 
-async fn index_site<'a>(url: &str, mut connection: &mut PoolConnection<Sqlite>) {
+async fn index_site<'a>(url: &str, connection: &mut PoolConnection<Sqlite>) {
     // 1. Download the site.
     // Use reqwest to download the site.
     let client = reqwest::Client::new();
     let body = client.get(url).send().await;
 
-    println!("Downloaded {}", url);
+    debugMessage!("Downloaded {}", url);
 
     if body.is_err() {
-        println!("Error downloading site: {}. Continuing to next site.", url);
+        debugMessage!("Error downloading site: {}. Continuing to next site.", url);
         return;
     }
 
     let body = body.unwrap();
 
     // 2. Parse the site.
-    println!("Parsing site: {}", url);
+    debugMessage!("Parsing site: {}", url);
     let parsed_site = html_parser::Dom::parse(body.text().await.unwrap().as_str());
 
     if parsed_site.is_err() {
-        println!("Error parsing site: {}. Moving on to next site.", url);
+        debugMessage!("Error parsing site: {}. Moving on to next site.", url);
         // TODO: Record this site as having an error so we don't try to index it again.
         return;
+    } else {
+        debugMessage!("Parsed site: {}", url);
     }
 
     let parsed_site = parsed_site.unwrap();
@@ -178,7 +231,7 @@ async fn index_site<'a>(url: &str, mut connection: &mut PoolConnection<Sqlite>) 
     let title: String;
 
     if titles.is_empty() {
-        println!("No title found for site: {}. Setting title to the default of 'Site'.", url);
+        debugMessage!("No title found for site: {}. Setting title to the default of 'Site'.", url);
         title = String::from("Site");
     } else {
         title = match titles[0].children[0] {
@@ -195,7 +248,7 @@ async fn index_site<'a>(url: &str, mut connection: &mut PoolConnection<Sqlite>) 
     let keywords: String;
 
     if keyword_elements.is_empty() {
-        println!("No keywords found for site: {}. Setting keywords to the default of 'None'.", url);
+        debugMessage!("No keywords found for site: {}. Setting keywords to the default of 'None'.", url);
         keywords = String::from("None");
     } else {
         keywords = keyword_elements[0].attributes["content"].clone().unwrap();
@@ -233,6 +286,8 @@ async fn index_site<'a>(url: &str, mut connection: &mut PoolConnection<Sqlite>) 
     }).map(|link| {
         link.to_string()
     }).collect();
+
+    debugMessage!("Inserting new links into the staging table.");
 
     for link in links {
         let rows = sqlx::query("SELECT * FROM staging WHERE url = ?;")
@@ -294,13 +349,14 @@ fn find_in_dom<F: Fn(&html_parser::Element) -> bool>(dom: html_parser::Dom, cond
             i += 1;
         }
 
-        for node in to_push {
-            elements.push(node);
-        }
         let mut j: usize = 0;
         for index in to_remove {
             elements.remove(index - j);
             j += 1;
+        }
+
+        for node in to_push {
+            elements.push(node);
         }
     }
 
