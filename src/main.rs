@@ -305,19 +305,19 @@ fn parse_relative_url(base_url: &str, relative_url: &str) -> String {
         return relative_url.to_string();
     }
 
+    // Get the base url without the path.
+    let base_url = base_url.split("/").collect::<Vec<&str>>();
+
     // Check if the relative_url is a relative url.
     if relative_url.starts_with("/") || relative_url.starts_with("./") {
-        // Get the base url without the path.
-        let base_url = base_url.split("/").collect::<Vec<&str>>();
-
         // Get the relative URL without the . if it has one.
         if relative_url.starts_with("./") {
-            return format!("{}//{}{}", base_url[0], base_url[2], &relative_url[2..]);
+            return format!("{}//{}/{}", base_url[0], base_url[2], &relative_url[2..]);
         } else {
-            return format!("{}//{}{}", base_url[0], base_url[2], &relative_url[1..]);
+            return format!("{}//{}/{}", base_url[0], base_url[2], &relative_url[1..]);
         }
     }
 
-    // Otherwise, it's invalid. Return an empty string.
-    return "".to_string();
+    // Otherwise, it doesn't have a base url.
+    return format!("{}//{}/{}", base_url[0], base_url[2], &relative_url);
 }
