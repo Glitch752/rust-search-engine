@@ -52,11 +52,12 @@ struct SearchResults {
     count: u32
 }
 
-#[get("/search?<query>")]
-async fn search(mut db: Connection<Sites>, query: String) -> Json<SearchResults> {
+#[get("/search?<query>&<page>")]
+async fn search(mut db: Connection<Sites>, query: String, page: u32) -> Json<SearchResults> {
     // Get sites from the database with similar titles
-    let sites: Vec<SqliteRow> = sqlx::query("SELECT title, url FROM sitedata WHERE title LIKE ? ESCAPE '\\' LIMIT 30")
+    let sites: Vec<SqliteRow> = sqlx::query("SELECT title, url FROM sitedata WHERE title LIKE ? ESCAPE '\\' LIMIT 30 OFFSET ?")
         .bind(format!("%{}%", query))
+        .bind((page - 1) * 30)
         .fetch_all(&mut *db)
         .await
         .unwrap();

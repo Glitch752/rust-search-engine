@@ -11,27 +11,42 @@
         // Get the search query from the URL
         const urlParams = new URLSearchParams(window.location.search);
         const query = urlParams.get('q');
+        const page = urlParams.get('page') || 1;
+
+        if(!urlParams.get('q')) {
+            window.location.href = '/';
+        }
         
         // Set the page title
         document.title = `Search results for "${query}"`;
         
-        let path = "/api/search?query=" + query;
+        let path = `/api/search?query=${query}&page=${page}`;
         let request = new XMLHttpRequest();
         request.open("GET", path);
         request.send();
         request.onload = function() {
             let results = JSON.parse(request.responseText);
 
+            let pageLinks = `
+                <div>
+                    ${page > 1 ? `<a href="/search?q=${query}&page=${parseInt(page) - 1}">Previous page</a>` : ''}
+                    ${results.count > results.sites.length && !(page * 30 > results.count) ? `<a href="/search?q=${query}&page=${parseInt(page) + 1}">Next page</a>` : ''}
+                </div>
+            `;
+
             // Set the page content
             document.body.innerHTML = `
                 <h1>Search results for "${query}"</h1>
+                ${pageLinks}
                 <h2>Found ${results.count} results</h2>
                 ${results.sites.map(result => `
                     <div>
-                        <h2>${result.title}</h2>
-                        <p>${result.url}</p>
+                        <h2><a href="${result.url}">${result.title}</a></h2>
+                        <a href="${result.url}">${result.url}</a>
                     </div>
                 `).join('')}
+                <br />
+                ${pageLinks}
             `;
         }
     </script>
