@@ -1,3 +1,4 @@
+use rocket::{tokio};
 use rocket::fairing::AdHoc;
 use rocket::fs::FileServer;
 use rocket::serde::{Serialize, json::Json};
@@ -45,57 +46,62 @@ async fn main() {
         .mount("/", FileServer::from("./public"))
         .mount("/api", routes![recommended, search])
         .attach(Sites::init())
-        .attach(AdHoc::on_liftoff("Liftoff Printer", |rocket| Box::pin(async move {
-            println!("Liftoff!");
-
-            // Look into the database 'sites' and find the staging table.
-            // If it's empty, then create it.
+        .attach(AdHoc::on_liftoff("Index web", |rocket| Box::pin(async move {
             let db: &Sites = Sites::fetch(&rocket).unwrap();
-        
-            let mut connection: PoolConnection<Sqlite> = db.acquire().await.unwrap();
-            // Turn the PoolConnection<Sqlite> into a SqlitePool
-        
-            // First, get the database connection from rocket.
-            // Then, make sure the staging table exists.
-        
-            sqlx::query("CREATE TABLE IF NOT EXISTS staging (url TEXT PRIMARY KEY);")
-                .execute(&mut connection)
-                .await
-                .unwrap();
-            println!("Staging table created if it didn't exist.");
-
-            // Create the sitedata table if it doesn't exist.
-            // This table has a url (text) as the primary key, a title (text), an array of text for keywords, and a rank (integer).
-            sqlx::query("CREATE TABLE IF NOT EXISTS sitedata (url TEXT PRIMARY KEY, title TEXT, keywords TEXT, rank INTEGER);")
-                .execute(&mut connection)
-                .await
-                .unwrap();
-            println!("Sitedata table created if it didn't exist.");
-
-            // Check if there are any sites in the sitedata table. If not, this is the first time we've started to index the web.
-            // If there are sites, then we can skip adding wikipedia to the staging table.
-            let rows = sqlx::query("SELECT * FROM sitedata;")
-                .fetch_all(&mut connection)
-                .await
-                .unwrap();
-
-            if rows.is_empty() {
-                // Add wikipedia to the staging table.
-                sqlx::query("INSERT INTO staging (url) VALUES (?);")
-                    .bind("https://en.wikipedia.org/wiki/Main_Page")
-                    .execute(&mut connection)
-                    .await
-                    .unwrap();
-                println!("Added wikipedia to the staging table.");
-            }
-
-            // Awesome! We can start indexing the web.
-            index_staged_sites(connection, db).await;
+            let connection: PoolConnection<Sqlite> = db.acquire().await.unwrap();
+            tokio::spawn(async move {
+                println!("Liftoff!");
+                index_web(connection).await;
+            });
         })))
         .launch().await;
 }
 
-async fn index_staged_sites(mut connection: PoolConnection<Sqlite>, db: &Sites) {
+async fn index_web(mut connection: PoolConnection<Sqlite>) {
+    println!("Indexing web...");
+    // Look into the database 'sites' and find the staging table.
+    // If it's empty, then create it.
+    // Turn the PoolConnection<Sqlite> into a SqlitePool
+
+    // First, get the database connection from rocket.
+    // Then, make sure the staging table exists.
+
+    sqlx::query("CREATE TABLE IF NOT EXISTS staging (url TEXT PRIMARY KEY);")
+        .execute(&mut connection)
+        .await
+        .unwrap();
+    println!("Staging table created if it didn't exist.");
+
+    // Create the sitedata table if it doesn't exist.
+    // This table has a url (text) as the primary key, a title (text), an array of text for keywords, and a rank (integer).
+    sqlx::query("CREATE TABLE IF NOT EXISTS sitedata (url TEXT PRIMARY KEY, title TEXT, keywords TEXT, rank INTEGER);")
+        .execute(&mut connection)
+        .await
+        .unwrap();
+    println!("Sitedata table created if it didn't exist.");
+
+    // Check if there are any sites in the sitedata table. If not, this is the first time we've started to index the web.
+    // If there are sites, then we can skip adding wikipedia to the staging table.
+    let rows = sqlx::query("SELECT * FROM sitedata;")
+        .fetch_all(&mut connection)
+        .await
+        .unwrap();
+
+    if rows.is_empty() {
+        // Add wikipedia to the staging table.
+        sqlx::query("INSERT INTO staging (url) VALUES (?);")
+            .bind("https://en.wikipedia.org/wiki/Main_Page")
+            .execute(&mut connection)
+            .await
+            .unwrap();
+        println!("Added wikipedia to the staging table.");
+    }
+
+    // Awesome! We can start indexing the web.
+    index_staged_sites(connection).await;
+}
+
+async fn index_staged_sites(mut connection: PoolConnection<Sqlite>) {
     // Get the first 100 sites from the staging table and remove them from the staging table.
     // Then, index them.
     let mut rows = sqlx::query("SELECT * FROM staging LIMIT 100;")
@@ -111,14 +117,15 @@ async fn index_staged_sites(mut connection: PoolConnection<Sqlite>, db: &Sites) 
             let url: String = row.get("url");
             println!("{}", url);
             // Make sure we don't move connection so it can be used in the next iteration of the loop.
-            let mut connection: PoolConnection<Sqlite> = db.acquire().await.unwrap();
             sqlx::query("DELETE FROM staging WHERE url = ?;")
                 .bind(url.clone())
                 .execute(&mut connection)
                 .await
                 .unwrap();
-    
-            index_site(url.as_str(), connection).await;
+
+            println!("Removed {} from the staging table.", url);
+
+            index_site(url.as_str(), &mut connection).await;
         }
 
         // Check if there are any more sites in the staging table.
@@ -133,14 +140,16 @@ async fn index_staged_sites(mut connection: PoolConnection<Sqlite>, db: &Sites) 
     }
 
     // We're done indexing the web!
-    println!("Done indexing the web! This probably shouldn't have been called unless this was left running for a rediculous amount of time.");
+    println!("Done indexing the web! This probably shouldn't have been called unless this was left running for a rediculous amount of time or something went wrong.");
 }
 
-async fn index_site(url: &str, mut connection: PoolConnection<Sqlite>) {
+async fn index_site<'a>(url: &str, mut connection: &mut PoolConnection<Sqlite>) {
     // 1. Download the site.
     // Use reqwest to download the site.
     let client = reqwest::Client::new();
     let body = client.get(url).send().await;
+
+    println!("Downloaded {}", url);
 
     if body.is_err() {
         println!("Error downloading site: {}. Continuing to next site.", url);
@@ -202,7 +211,7 @@ async fn index_site(url: &str, mut connection: PoolConnection<Sqlite>) {
         .bind(title)
         .bind(keywords)
         .bind(rank)
-        .execute(&mut connection)
+        .execute(&mut *connection)
         .await
         .unwrap();
 
@@ -226,21 +235,22 @@ async fn index_site(url: &str, mut connection: PoolConnection<Sqlite>) {
     }).collect();
 
     for link in links {
-        let mut rows = sqlx::query("SELECT * FROM staging WHERE url = ?;")
+        let rows = sqlx::query("SELECT * FROM staging WHERE url = ?;")
             .bind(link.clone())
-            .fetch_all(&mut connection)
+            .fetch_all(&mut *connection)
             .await
             .unwrap();
         if rows.is_empty() {
+            let 
             rows = sqlx::query("SELECT * FROM sitedata WHERE url = ?;")
                 .bind(link.clone())
-                .fetch_all(&mut connection)
+                .fetch_all(&mut *connection)
                 .await
                 .unwrap();
             if rows.is_empty() {
                 sqlx::query("INSERT INTO staging (url) VALUES (?);")
                     .bind(link)
-                    .execute(&mut connection)
+                    .execute(&mut *connection)
                     .await
                     .unwrap();
             }
@@ -315,6 +325,20 @@ fn parse_relative_url(base_url: &str, relative_url: &str) -> String {
             return format!("{}//{}/{}", base_url[0], base_url[2], &relative_url[2..]);
         } else {
             return format!("{}//{}/{}", base_url[0], base_url[2], &relative_url[1..]);
+        }
+    }
+    
+    // Check if the start of relative_url is a site without a protocol.
+    let url_regex = regex::Regex::new(r"^(?P<site>[a-zA-Z0-9\.\-]+)(?P<path>/.*)?$").unwrap();
+    let url_match = url_regex.captures(relative_url);
+    if url_match.is_some() {
+        let url_match = url_match.unwrap();
+        let site = url_match.name("site");
+        let path = url_match.name("path");
+        if site.is_some() && path.is_some() {
+            return format!("http://{}/{}", site.unwrap().as_str(), path.unwrap().as_str());
+        } else if site.is_some() {
+            return format!("http://{}/", site.unwrap().as_str());
         }
     }
 
