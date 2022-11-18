@@ -53,6 +53,7 @@ async fn main() {
             let db: &Sites = Sites::fetch(&rocket).unwrap();
         
             let mut connection: PoolConnection<Sqlite> = db.acquire().await.unwrap();
+            // Turn the PoolConnection<Sqlite> into a SqlitePool
         
             // First, get the database connection from rocket.
             // Then, make sure the staging table exists.
@@ -65,7 +66,7 @@ async fn main() {
 
             // Create the sitedata table if it doesn't exist.
             // This table has a url (text) as the primary key, a title (text), an array of text for keywords, and a rank (integer).
-            sqlx::query("CREATE TABLE IF NOT EXISTS sitedata (url TEXT PRIMARY KEY, title TEXT, keywords TEXT[], rank INTEGER);")
+            sqlx::query("CREATE TABLE IF NOT EXISTS sitedata (url TEXT PRIMARY KEY, title TEXT, keywords TEXT, rank INTEGER);")
                 .execute(&mut connection)
                 .await
                 .unwrap();
@@ -73,7 +74,7 @@ async fn main() {
 
             // Check if there are any sites in the sitedata table. If not, this is the first time we've started to index the web.
             // If there are sites, then we can skip adding wikipedia to the staging table.
-            let mut rows = sqlx::query("SELECT * FROM sitedata;")
+            let rows = sqlx::query("SELECT * FROM sitedata;")
                 .fetch_all(&mut connection)
                 .await
                 .unwrap();
@@ -89,32 +90,234 @@ async fn main() {
             }
 
             // Awesome! We can start indexing the web.
-            index_staged_sites(connection).await;
+            index_staged_sites(connection, db).await;
         })))
         .launch().await;
 }
 
-async fn index_staged_sites(mut connection: PoolConnection<Sqlite>) {
+async fn index_staged_sites(mut connection: PoolConnection<Sqlite>, db: &Sites) {
     // Get the first 100 sites from the staging table and remove them from the staging table.
     // Then, index them.
-    let rows = sqlx::query("SELECT * FROM staging LIMIT 100;")
+    let mut rows = sqlx::query("SELECT * FROM staging LIMIT 100;")
         .fetch_all(&mut connection)
         .await
         .unwrap();
+
+    let mut are_staged_sites: bool = true;
+
+    while are_staged_sites {
+        // Remove the sites from the staging table.
+        for row in &rows {
+            let url: String = row.get("url");
+            println!("{}", url);
+            // Make sure we don't move connection so it can be used in the next iteration of the loop.
+            let mut connection: PoolConnection<Sqlite> = db.acquire().await.unwrap();
+            sqlx::query("DELETE FROM staging WHERE url = ?;")
+                .bind(url.clone())
+                .execute(&mut connection)
+                .await
+                .unwrap();
     
-    // Remove the sites from the staging table.
-    for row in &rows {
-        let url: String = row.get("url");
-        sqlx::query("DELETE FROM staging WHERE url = ?;")
-            .bind(url.clone())
-            .execute(&mut connection)
+            index_site(url.as_str(), connection).await;
+        }
+
+        // Check if there are any more sites in the staging table.
+        rows = sqlx::query("SELECT * FROM staging LIMIT 100;")
+            .fetch_all(&mut connection)
             .await
             .unwrap();
+        
+        if rows.is_empty() {
+            are_staged_sites = false;
+        }
+    }
 
-        index_site(url.as_str());
+    // We're done indexing the web!
+    println!("Done indexing the web! This probably shouldn't have been called unless this was left running for a rediculous amount of time.");
+}
+
+async fn index_site(url: &str, mut connection: PoolConnection<Sqlite>) {
+    // 1. Download the site.
+    // Use reqwest to download the site.
+    let client = reqwest::Client::new();
+    let body = client.get(url).send().await;
+
+    if body.is_err() {
+        println!("Error downloading site: {}. Continuing to next site.", url);
+        return;
+    }
+
+    let body = body.unwrap();
+
+    // 2. Parse the site.
+    println!("Parsing site: {}", url);
+    let parsed_site = html_parser::Dom::parse(body.text().await.unwrap().as_str());
+
+    if parsed_site.is_err() {
+        println!("Error parsing site: {}. Moving on to next site.", url);
+        // TODO: Record this site as having an error so we don't try to index it again.
+        return;
+    }
+
+    let parsed_site = parsed_site.unwrap();
+    
+    // 3. Get the title of the site.
+    let titles: Vec<html_parser::Element> = find_in_dom(parsed_site.clone(), |node| {
+        node.name == "title".to_string()
+    });
+
+    let title: String;
+
+    if titles.is_empty() {
+        println!("No title found for site: {}. Setting title to the default of 'Site'.", url);
+        title = String::from("Site");
+    } else {
+        title = match titles[0].children[0] {
+            html_parser::Node::Text(ref contents) => contents.clone(),
+            _ => "".to_string()
+        };
+    }
+
+    // 4. Get the keywords of the site.
+    let keyword_elements: Vec<html_parser::Element> = find_in_dom(parsed_site.clone(), |node| {
+        node.name == "meta".to_string() && node.attributes.contains_key("name") && node.attributes["name"] == Some("keywords".to_string())
+    });
+
+    let keywords: String;
+
+    if keyword_elements.is_empty() {
+        println!("No keywords found for site: {}. Setting keywords to the default of 'None'.", url);
+        keywords = String::from("None");
+    } else {
+        keywords = keyword_elements[0].attributes["content"].clone().unwrap();
+    }
+
+    // 5. Get the rank of the site.
+    let rank = 0;
+    // TODO: Rank other sites higher when we find links to them.
+
+    // 6. Add the site to the sitedata table.
+    sqlx::query("INSERT INTO sitedata (url, title, keywords, rank) VALUES (?, ?, ?, ?);")
+        .bind(url)
+        .bind(title)
+        .bind(keywords)
+        .bind(rank)
+        .execute(&mut connection)
+        .await
+        .unwrap();
+
+    // 7. Add links to the staging table if they aren't already in the staging table or the sitedata table.
+    let link_elements: Vec<html_parser::Element> = find_in_dom(parsed_site, |node| {
+        node.name == "a"
+    });
+    // Go through the link_elements and turn them into strings of the href attribute.
+    let mut links: Vec<String> = Vec::new();
+    for link_element in link_elements {
+        if link_element.attributes.contains_key("href") {
+            let absolute_url: String = parse_relative_url(url, link_element.attributes["href"].clone().unwrap().as_str());
+            links.push(absolute_url);
+        }
+    }
+    
+    let links: Vec<String> = links.iter().filter(|link| {
+        !link.is_empty()
+    }).map(|link| {
+        link.to_string()
+    }).collect();
+
+    for link in links {
+        let mut rows = sqlx::query("SELECT * FROM staging WHERE url = ?;")
+            .bind(link.clone())
+            .fetch_all(&mut connection)
+            .await
+            .unwrap();
+        if rows.is_empty() {
+            rows = sqlx::query("SELECT * FROM sitedata WHERE url = ?;")
+                .bind(link.clone())
+                .fetch_all(&mut connection)
+                .await
+                .unwrap();
+            if rows.is_empty() {
+                sqlx::query("INSERT INTO staging (url) VALUES (?);")
+                    .bind(link)
+                    .execute(&mut connection)
+                    .await
+                    .unwrap();
+            }
+        }
     }
 }
 
-fn index_site(url: &str) {
-    // TODO: Implement indexing
+fn find_in_dom<F: Fn(&html_parser::Element) -> bool>(dom: html_parser::Dom, condition: F) -> Vec<html_parser::Element> {
+    let mut elements: Vec<html_parser::Element> = Vec::new();
+    let mut final_elements: Vec<html_parser::Element> = Vec::new();
+
+    for node in dom.children {
+        match node {
+            html_parser::Node::Element(ref element) => {
+                elements.push(element.clone());
+            },
+            _ => {}
+        }
+    }
+
+    let mut elements_have_children: bool = true;
+    while elements_have_children {
+        elements_have_children = false;
+        let mut to_push: Vec<html_parser::Element> = vec![];
+        let mut to_remove: Vec<usize> = vec![];
+        let mut i: usize = 0;
+        for node in &elements {
+            if condition(node) {
+                final_elements.push(node.clone());
+            }
+            for child in node.children.clone() {
+                match child {
+                    html_parser::Node::Element(ref element) => {
+                        to_push.push(element.clone());
+                        elements_have_children = true;
+                    },
+                    _ => {}
+                }
+            }
+            to_remove.push(i);
+            i += 1;
+        }
+
+        for node in to_push {
+            elements.push(node);
+        }
+        let mut j: usize = 0;
+        for index in to_remove {
+            elements.remove(index - j);
+            j += 1;
+        }
+    }
+
+    final_elements
+}
+
+fn parse_relative_url(base_url: &str, relative_url: &str) -> String {
+    // TODO: Make this actually test for all cases.
+
+    // Check if the relative_url is a full url.
+    if relative_url.starts_with("http://") || relative_url.starts_with("https://") {
+        return relative_url.to_string();
+    }
+
+    // Check if the relative_url is a relative url.
+    if relative_url.starts_with("/") || relative_url.starts_with("./") {
+        // Get the base url without the path.
+        let base_url = base_url.split("/").collect::<Vec<&str>>();
+
+        // Get the relative URL without the . if it has one.
+        if relative_url.starts_with("./") {
+            return format!("{}//{}{}", base_url[0], base_url[2], &relative_url[2..]);
+        } else {
+            return format!("{}//{}{}", base_url[0], base_url[2], &relative_url[1..]);
+        }
+    }
+
+    // Otherwise, it's invalid. Return an empty string.
+    return "".to_string();
 }
