@@ -3,6 +3,8 @@ use rocket::fairing::AdHoc;
 use rocket::fs::FileServer;
 use rocket::serde::{Serialize, json::Json};
 
+use scraper::{Html, Selector, ElementRef};
+
 // Runs prinln!() with all the arguments if the debug flag is passed on the command line.
 // This function can take as many arguments as needed.
 
@@ -222,56 +224,57 @@ async fn index_site<'a>(url: &str, connection: &mut PoolConnection<Sqlite>) {
         return;
     }
 
-    let text: String = body.text().await.unwrap();
+    let (title, keywords, rank, links): (String, String, i32, Vec<String>) = {
+        let text: String = body.text().await.unwrap();
 
-    // 2. Parse the site.
-    debugMessage!("Parsing site: {}", url);
-    let parsed_site = html_parser::Dom::parse(text.as_str());
+        // 2. Parse the site.
+        debugMessage!("Parsing site: {}", url);
+        let document: Html = Html::parse_document(text.as_str());
 
-    if parsed_site.is_err() {
-        debugMessage!("Error parsing site: {}. Moving on to next site.", url);
-        // TODO: Record this site as having an error so we don't try to index it again.
-        return;
-    } else {
         debugMessage!("Parsed site: {}", url);
-    }
+        
+        // 3. Get the title of the site.
+        let titles: Vec<ElementRef> = document.select(&Selector::parse("title").unwrap()).collect();
 
-    let parsed_site = parsed_site.unwrap();
-    
-    // 3. Get the title of the site.
-    let titles: Vec<html_parser::Element> = find_in_dom(parsed_site.clone(), |node| {
-        node.name == "title".to_string()
-    });
-
-    let title: String;
-
-    if titles.is_empty() {
-        debugMessage!("No title found for site: {}. Setting title to the default of 'Site'.", url);
-        title = String::from("Site");
-    } else {
-        title = match titles[0].children[0] {
-            html_parser::Node::Text(ref contents) => contents.clone(),
-            _ => "".to_string()
+        let title: String = if titles.is_empty() {
+            debugMessage!("No title found for site {}.", url);
+            "No title".to_string()
+        } else {
+            debugMessage!("Title found for site {}: {}.", url, titles[0].text().collect::<String>());
+            titles[0].text().collect()
         };
-    }
 
-    // 4. Get the keywords of the site.
-    let keyword_elements: Vec<html_parser::Element> = find_in_dom(parsed_site.clone(), |node| {
-        node.name == "meta".to_string() && node.attributes.contains_key("name") && node.attributes["name"] == Some("keywords".to_string())
-    });
+        // 4. Get the keywords of the site.
+        let keyword_elements: Vec<ElementRef> = document.select(&Selector::parse("meta[name='keywords']").unwrap()).collect();
 
-    let keywords: String;
+        let keywords: String = if keyword_elements.is_empty() {
+            debugMessage!("No keywords found for site {}.", url);
+            "No keywords".to_string()
+        } else {
+            let keywords: &str = keyword_elements[0].value().attr("content").unwrap_or("");
+            debugMessage!("Keywords found for site {}: {}.", url, keywords);
+            keywords.to_string()
+        };
 
-    if keyword_elements.is_empty() {
-        debugMessage!("No keywords found for site: {}. Setting keywords to the default of 'None'.", url);
-        keywords = String::from("None");
-    } else {
-        keywords = keyword_elements[0].attributes["content"].clone().unwrap();
-    }
+        // 5. Get the rank of the site.
+        let rank = 0;
+        // TODO: Rank other sites higher when we find links to them.
 
-    // 5. Get the rank of the site.
-    let rank = 0;
-    // TODO: Rank other sites higher when we find links to them.
+        // 7. Add links to the staging table if they aren't already in the staging table or the sitedata table.
+        let links: Vec<String> = document.select(&Selector::parse("a").unwrap()).map(|link| {
+            let value: &str = link.value().attr("href").unwrap_or("");
+            let absolute_url: String = parse_relative_url(url, value);
+            absolute_url
+        }).collect();
+        
+        let links: Vec<String> = links.iter().filter(|link| {
+            !link.is_empty()
+        }).map(|link| {
+            link.to_string()
+        }).collect();
+
+        (title, keywords, rank, links)
+    };
 
     // 6. Add the site to the sitedata table.
     sqlx::query("INSERT INTO sitedata (url, title, keywords, rank) VALUES (?, ?, ?, ?);")
@@ -283,25 +286,6 @@ async fn index_site<'a>(url: &str, connection: &mut PoolConnection<Sqlite>) {
         .await
         .unwrap();
 
-    // 7. Add links to the staging table if they aren't already in the staging table or the sitedata table.
-    let link_elements: Vec<html_parser::Element> = find_in_dom(parsed_site, |node| {
-        node.name == "a"
-    });
-    // Go through the link_elements and turn them into strings of the href attribute.
-    let mut links: Vec<String> = Vec::new();
-    for link_element in link_elements {
-        if link_element.attributes.contains_key("href") {
-            let absolute_url: String = parse_relative_url(url, link_element.attributes["href"].clone().unwrap().as_str());
-            links.push(absolute_url);
-        }
-    }
-    
-    let links: Vec<String> = links.iter().filter(|link| {
-        !link.is_empty()
-    }).map(|link| {
-        link.to_string()
-    }).collect();
-
     debugMessage!("Inserting new links into the staging table.");
 
     for link in links {
@@ -311,8 +295,7 @@ async fn index_site<'a>(url: &str, connection: &mut PoolConnection<Sqlite>) {
             .await
             .unwrap();
         if rows.is_empty() {
-            let 
-            rows = sqlx::query("SELECT * FROM sitedata WHERE url = ?;")
+            let rows = sqlx::query("SELECT * FROM sitedata WHERE url = ?;")
                 .bind(link.clone())
                 .fetch_all(&mut *connection)
                 .await
@@ -326,56 +309,6 @@ async fn index_site<'a>(url: &str, connection: &mut PoolConnection<Sqlite>) {
             }
         }
     }
-}
-
-fn find_in_dom<F: Fn(&html_parser::Element) -> bool>(dom: html_parser::Dom, condition: F) -> Vec<html_parser::Element> {
-    let mut elements: Vec<html_parser::Element> = Vec::new();
-    let mut final_elements: Vec<html_parser::Element> = Vec::new();
-
-    for node in dom.children {
-        match node {
-            html_parser::Node::Element(ref element) => {
-                elements.push(element.clone());
-            },
-            _ => {}
-        }
-    }
-
-    let mut elements_have_children: bool = true;
-    while elements_have_children {
-        elements_have_children = false;
-        let mut to_push: Vec<html_parser::Element> = vec![];
-        let mut to_remove: Vec<usize> = vec![];
-        let mut i: usize = 0;
-        for node in &elements {
-            if condition(node) {
-                final_elements.push(node.clone());
-            }
-            for child in node.children.clone() {
-                match child {
-                    html_parser::Node::Element(ref element) => {
-                        to_push.push(element.clone());
-                        elements_have_children = true;
-                    },
-                    _ => {}
-                }
-            }
-            to_remove.push(i);
-            i += 1;
-        }
-
-        let mut j: usize = 0;
-        for index in to_remove {
-            elements.remove(index - j);
-            j += 1;
-        }
-
-        for node in to_push {
-            elements.push(node);
-        }
-    }
-
-    final_elements
 }
 
 fn parse_relative_url(base_url: &str, relative_url: &str) -> String {
