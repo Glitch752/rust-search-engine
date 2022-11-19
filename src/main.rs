@@ -127,21 +127,23 @@ async fn index_web(mut connection: PoolConnection<Sqlite>) {
         .unwrap();
     debugMessage!("Sitedata table created if it didn't exist.");
 
+    let default_site: String = "https://github.com/".to_string();
+
     // Check if there are any sites in the sitedata table. If not, this is the first time we've started to index the web.
-    // If there are sites, then we can skip adding wikipedia to the staging table.
+    // If there are sites, then we can skip adding the default site to the staging table.
     let rows = sqlx::query("SELECT * FROM sitedata;")
         .fetch_all(&mut connection)
         .await
         .unwrap();
 
     if rows.is_empty() {
-        // Add wikipedia to the staging table.
+        // Add the default site to the staging table.
         sqlx::query("INSERT INTO staging (url) VALUES (?);")
-            .bind("https://en.wikipedia.org/wiki/Main_Page")
+            .bind(default_site.clone())
             .execute(&mut connection)
             .await
             .unwrap();
-        debugMessage!("Added wikipedia to the staging table.");
+        debugMessage!("Added {} to the staging table.", default_site);
     }
 
     // Awesome! We can start indexing the web.
@@ -157,6 +159,8 @@ async fn index_staged_sites(mut connection: PoolConnection<Sqlite>) {
         .unwrap();
 
     let mut are_staged_sites: bool = true;
+
+    let mut sites_scanned: u64 = 0;
 
     while are_staged_sites {
         // Remove the sites from the staging table.
@@ -175,6 +179,9 @@ async fn index_staged_sites(mut connection: PoolConnection<Sqlite>) {
             index_site(url.as_str(), &mut connection).await;
 
             debugMessage!("Indexed {}.", url);
+
+            sites_scanned += 1;
+            debugMessage!("Sites scanned: {}", sites_scanned);
         }
 
         debugMessage!("Finished indexing set of 100 staged sites.");
@@ -210,9 +217,16 @@ async fn index_site<'a>(url: &str, connection: &mut PoolConnection<Sqlite>) {
 
     let body = body.unwrap();
 
+    if !body.status().is_success() {
+        debugMessage!("Error downloading site: {}. Response code: {}. Continuing to next site.", url, body.status().as_str());
+        return;
+    }
+
+    let text: String = body.text().await.unwrap();
+
     // 2. Parse the site.
     debugMessage!("Parsing site: {}", url);
-    let parsed_site = html_parser::Dom::parse(body.text().await.unwrap().as_str());
+    let parsed_site = html_parser::Dom::parse(text.as_str());
 
     if parsed_site.is_err() {
         debugMessage!("Error parsing site: {}. Moving on to next site.", url);
