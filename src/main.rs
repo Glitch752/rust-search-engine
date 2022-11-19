@@ -208,6 +208,7 @@ async fn index_site<'a>(url: &str, connection: &mut PoolConnection<Sqlite>) {
     // 1. Download the site.
     // Use reqwest to download the site.
     let client = reqwest::Client::new();
+
     let body = client.get(url).send().await;
 
     debugMessage!("Downloaded {}", url);
@@ -221,6 +222,12 @@ async fn index_site<'a>(url: &str, connection: &mut PoolConnection<Sqlite>) {
 
     if !body.status().is_success() {
         debugMessage!("Error downloading site: {}. Response code: {}. Continuing to next site.", url, body.status().as_str());
+        return;
+    }
+    
+    // Make sure the result is a website and not a different file format.
+    if !body.headers().get("content-type").unwrap().to_str().unwrap().contains("text/html") {
+        debugMessage!("{} is not a website. Continuing to next site.", url);
         return;
     }
 
@@ -313,6 +320,10 @@ async fn index_site<'a>(url: &str, connection: &mut PoolConnection<Sqlite>) {
 
 fn parse_relative_url(base_url: &str, relative_url: &str) -> String {
     // TODO: Make this actually test for all cases.
+    // Remove all the query parameters of the relative url
+    let relative_url = relative_url.split('?').collect::<Vec<&str>>()[0];
+    // Remove all the hash parameters of the relative url
+    let relative_url = relative_url.split('#').collect::<Vec<&str>>()[0];
 
     // Check if the relative_url is a full url.
     if relative_url.starts_with("http://") || relative_url.starts_with("https://") {
