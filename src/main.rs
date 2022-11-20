@@ -1,3 +1,4 @@
+use reqwest::Client;
 use rocket::{tokio};
 use rocket::fairing::AdHoc;
 use rocket::fs::FileServer;
@@ -17,6 +18,9 @@ macro_rules! debugMessage {
         }
     }
 }
+
+// TODO: Implement concurrent requests to increase performance
+// const CONCURRENT_INDEXING_AMOUNT: usize = 10; // How many network requests to make at once when indexing
 
 #[macro_use] extern crate rocket;
 
@@ -96,6 +100,10 @@ async fn main() {
         .mount("/api", routes![recommended, search])
         .attach(Sites::init())
         .attach(AdHoc::on_liftoff("Index web", |rocket| Box::pin(async move {
+            if std::env::args().any(|x| x == "--no-index") {
+                return;
+            }
+
             let db: &Sites = Sites::fetch(&rocket).unwrap();
             let connection: PoolConnection<Sqlite> = db.acquire().await.unwrap();
             tokio::spawn(async move {
@@ -164,6 +172,8 @@ async fn index_staged_sites(mut connection: PoolConnection<Sqlite>) {
 
     let mut sites_scanned: u64 = 0;
 
+    let client = reqwest::Client::new();
+
     while are_staged_sites {
         // Remove the sites from the staging table.
         for row in &rows {
@@ -178,7 +188,7 @@ async fn index_staged_sites(mut connection: PoolConnection<Sqlite>) {
 
             debugMessage!("Removed {} from the staging table.", url);
 
-            index_site(url.as_str(), &mut connection).await;
+            index_site(url.as_str(), &mut connection, &client).await;
 
             debugMessage!("Indexed {}.", url);
 
@@ -204,11 +214,12 @@ async fn index_staged_sites(mut connection: PoolConnection<Sqlite>) {
     println!("Done indexing the web! This probably shouldn't have been called unless this was left running for a rediculous amount of time or something went wrong.");
 }
 
-async fn index_site<'a>(url: &str, connection: &mut PoolConnection<Sqlite>) {
+async fn index_site(url: &str, connection: &mut PoolConnection<Sqlite>, client: &Client) {
     // 1. Download the site.
     // Use reqwest to download the site.
-    let client = reqwest::Client::new();
+    println!("Downloading {}...", url);
 
+    // Make sure that we can get the site, even if it's a redirect.
     let body = client.get(url).send().await;
 
     debugMessage!("Downloaded {}", url);
@@ -232,7 +243,14 @@ async fn index_site<'a>(url: &str, connection: &mut PoolConnection<Sqlite>) {
     }
 
     let (title, keywords, rank, links): (String, String, i32, Vec<String>) = {
-        let text: String = body.text().await.unwrap();
+        let text = body.text().await;
+
+        if text.is_err() {
+            debugMessage!("Error getting text from site: {}. Continuing to next site.", url);
+            return;
+        }
+
+        let text: String = text.unwrap();
 
         // 2. Parse the site.
         debugMessage!("Parsing site: {}", url);
@@ -319,7 +337,19 @@ async fn index_site<'a>(url: &str, connection: &mut PoolConnection<Sqlite>) {
 }
 
 fn parse_relative_url(base_url: &str, relative_url: &str) -> String {
-    // TODO: Make this actually test for all cases.
+    let url: String = get_relative_url(base_url, relative_url);
+
+    // Make sure the url is valid.
+    let url_regex = regex::Regex::new(r"^(?P<protocol>http|https)://(?P<site>[a-zA-Z0-9\.\-]+)(?P<path>/.*)?$").unwrap();
+    let url_match = url_regex.captures(&url);
+    if url_match.is_none() {
+        return "".to_string();
+    }
+
+    url
+}
+
+fn get_relative_url(base_url: &str, relative_url: &str) -> String {// TODO: Make this actually test for all cases.
     // Remove all the query parameters of the relative url
     let relative_url = relative_url.split('?').collect::<Vec<&str>>()[0];
     // Remove all the hash parameters of the relative url
@@ -327,7 +357,7 @@ fn parse_relative_url(base_url: &str, relative_url: &str) -> String {
 
     // Check if the relative_url is a full url.
     if relative_url.starts_with("http://") || relative_url.starts_with("https://") {
-        return relative_url.to_string();
+        return relative_url.to_string()
     }
 
     // Get the base url without the path.
@@ -337,9 +367,9 @@ fn parse_relative_url(base_url: &str, relative_url: &str) -> String {
     if relative_url.starts_with("/") || relative_url.starts_with("./") {
         // Get the relative URL without the . if it has one.
         if relative_url.starts_with("./") {
-            return format!("{}//{}/{}", base_url[0], base_url[2], &relative_url[2..]);
+            return format!("{}//{}/{}", base_url[0], base_url[2], &relative_url[2..])
         } else {
-            return format!("{}//{}/{}", base_url[0], base_url[2], &relative_url[1..]);
+            return format!("{}//{}/{}", base_url[0], base_url[2], &relative_url[1..])
         }
     }
     
@@ -351,12 +381,12 @@ fn parse_relative_url(base_url: &str, relative_url: &str) -> String {
         let site = url_match.name("site");
         let path = url_match.name("path");
         if site.is_some() && path.is_some() {
-            return format!("http://{}/{}", site.unwrap().as_str(), path.unwrap().as_str());
+            return format!("http://{}/{}", site.unwrap().as_str(), path.unwrap().as_str())
         } else if site.is_some() {
-            return format!("http://{}/", site.unwrap().as_str());
+            return format!("http://{}/", site.unwrap().as_str())
         }
     }
 
     // Otherwise, it doesn't have a base url.
-    return format!("{}//{}/{}", base_url[0], base_url[2], &relative_url);
+    return format!("{}//{}/{}", base_url[0], base_url[2], &relative_url)
 }
