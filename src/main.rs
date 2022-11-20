@@ -1,4 +1,4 @@
-use std::{time::Duration, sync::{Arc, Mutex}};
+use std::{time::Duration, sync::{Arc, Mutex}, collections::HashSet};
 
 use reqwest::header::HeaderValue;
 use rocket::{tokio, futures::{stream, StreamExt}};
@@ -125,7 +125,7 @@ async fn index_web(mut connection: PoolConnection<Sqlite>) {
     // First, get the database connection from rocket.
     // Then, make sure the staging table exists.
 
-    sqlx::query("CREATE TABLE IF NOT EXISTS staging (url TEXT PRIMARY KEY);")
+    sqlx::query("CREATE TABLE IF NOT EXISTS staging (url TEXT PRIMARY KEY, temprank INTEGER);")
         .execute(&mut connection)
         .await
         .unwrap();
@@ -191,9 +191,12 @@ async fn index_staged_sites(mut connection: PoolConnection<Sqlite>) {
 
     while are_staged_sites {
         // Remove the sites from the staging table.
-        let urls: Vec<String> = rows.iter().map(|row| row.try_get::<&str, &str>("url").unwrap_or("Unknown").to_string()).collect();
+        let sites: Vec<(String, u32)> = rows.iter().map(|row| {
+            (row.try_get::<&str, &str>("url").unwrap_or("Unknown").to_string(),
+             row.try_get::<u32, &str>("temprank").unwrap_or(0))
+        }).collect();
 
-        let url_sql: String = urls.iter().map(|url| format!("'{}'", url)).collect::<Vec<String>>().join(", ");
+        let url_sql: String = sites.iter().map(|(url, _)| format!("'{}'", url)).collect::<Vec<String>>().join(", ");
         println!("({})", url_sql);
 
         // TODO: This could potentially create a SQL injection vulnerability with the right URL, but .bind doesn't work with IN.
@@ -207,12 +210,12 @@ async fn index_staged_sites(mut connection: PoolConnection<Sqlite>) {
         debugMessage!("Removed {} sites from the staging table.", amount);
 
         // Download the sites concurrently.
-        let bodies = stream::iter(urls)
-            .map(|url| {
+        let bodies = stream::iter(sites)
+            .map(|(url, rank)| {
                 let client = &client;
                 async move {
                     let resp = client.get(url.clone()).send().await?;
-                    Ok::<(String, reqwest::Response), reqwest::Error>((url, resp))
+                    Ok::<(String, reqwest::Response, u32), reqwest::Error>((url, resp, rank))
                 }
             })
             .buffer_unordered(CONCURRENT_INDEXING_AMOUNT as usize);
@@ -221,11 +224,12 @@ async fn index_staged_sites(mut connection: PoolConnection<Sqlite>) {
         let new_connection = Arc::new(tokio::sync::Mutex::new(&mut connection));
 
         bodies
-            .for_each(|b: Result<(String, reqwest::Response), reqwest::Error>| async {
+            .for_each(|b: Result<(String, reqwest::Response, u32), reqwest::Error>| async {
                 match b {
                     Ok(b) => {
                         let url: String = b.0;
                         let body: reqwest::Response = b.1;
+                        let rank: u32 = b.2;
 
                         // Add 1 to the sites scanned (sites_scanned is an Arc<Mutex<u64>>).
                         *sites_scanned.lock().unwrap() += 1;
@@ -235,12 +239,13 @@ async fn index_staged_sites(mut connection: PoolConnection<Sqlite>) {
                         
                         debugMessage!("Downloaded {}: {}/{} concurrent requests completed. Total sites scanned: {}", url, *sites_scanned.lock().unwrap(), CONCURRENT_INDEXING_AMOUNT, *total_sites_scanned.lock().unwrap());
                         
-                        let retry: bool = index_site(url.as_str(), body, new_connection.lock().await).await;
+                        let retry: bool = index_site(url.as_str(), rank, body, new_connection.lock().await).await;
 
                         if retry {
                             // Add the site back to the staging table.
-                            sqlx::query("INSERT INTO staging (url) VALUES (?);")
+                            sqlx::query("INSERT INTO staging (url, temprank) VALUES (?, ?);")
                                 .bind(url.clone())
+                                .bind(rank)
                                 .execute(&mut new_connection.lock().await as &mut PoolConnection<Sqlite>)
                                 .await
                                 .unwrap();
@@ -278,7 +283,7 @@ async fn index_staged_sites(mut connection: PoolConnection<Sqlite>) {
 }
 
 // The return value of this function determines whether we should retry the request or not.
-async fn index_site(url: &str, body: reqwest::Response, mut connection: tokio::sync::MutexGuard<'_, &mut PoolConnection<Sqlite>>) -> bool {
+async fn index_site(url: &str, rank: u32, body: reqwest::Response, mut connection: tokio::sync::MutexGuard<'_, &mut PoolConnection<Sqlite>>) -> bool {
     // 1. Download the site.
     // Use reqwest to download the site.
 
@@ -308,7 +313,7 @@ async fn index_site(url: &str, body: reqwest::Response, mut connection: tokio::s
         return false;
     }
 
-    let (title, keywords, rank, links): (String, String, i32, Vec<String>) = {
+    let (title, keywords, links): (String, String, Vec<String>) = {
         let text = body.text().await;
 
         if text.is_err() {
@@ -347,11 +352,7 @@ async fn index_site(url: &str, body: reqwest::Response, mut connection: tokio::s
             keywords.to_string()
         };
 
-        // 5. Get the rank of the site.
-        let rank = 0;
-        // TODO: Rank other sites higher when we find links to them.
-
-        // 7. Add links to the staging table if they aren't already in the staging table or the sitedata table.
+        // 5. Add links to the staging table if they aren't already in the staging table or the sitedata table.
         let links: Vec<String> = document.select(&Selector::parse("a").unwrap()).map(|link| {
             let value: &str = link.value().attr("href").unwrap_or("");
             let absolute_url: String = parse_relative_url(url, value);
@@ -364,7 +365,10 @@ async fn index_site(url: &str, body: reqwest::Response, mut connection: tokio::s
             link.to_string()
         }).collect();
 
-        (title, keywords, rank, links)
+        // Deduplicate the links.
+        let links: Vec<String> = links.iter().cloned().collect::<HashSet<String>>().into_iter().collect();
+
+        (title, keywords, links)
     };
 
     // 6. Add the site to the sitedata table.
@@ -401,7 +405,23 @@ async fn index_site(url: &str, body: reqwest::Response, mut connection: tokio::s
                     .execute(&mut connection as &mut PoolConnection<Sqlite>)
                     .await
                     .unwrap();
+            } else {
+                debugMessage!("{} is already in the sitedata table.", link);
+                // Increase the rank of the site by 1.
+                sqlx::query("UPDATE sitedata SET rank = rank + 1 WHERE url = ?;")
+                    .bind(link)
+                    .execute(&mut connection as &mut PoolConnection<Sqlite>)
+                    .await
+                    .unwrap();
             }
+        } else {
+            debugMessage!("{} is already in the staging table.", link);
+            // Increase the temprank of the staged site by 1.
+            sqlx::query("UPDATE staging SET temprank = temprank + 1 WHERE url = ?;")
+                .bind(link)
+                .execute(&mut connection as &mut PoolConnection<Sqlite>)
+                .await
+                .unwrap();
         }
     }
 
