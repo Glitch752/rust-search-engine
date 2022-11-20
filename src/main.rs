@@ -1,5 +1,6 @@
-use reqwest::Client;
-use rocket::{tokio};
+use std::{time::Duration, sync::{Arc, Mutex}};
+
+use rocket::{tokio, futures::{stream, StreamExt}};
 use rocket::fairing::AdHoc;
 use rocket::fs::FileServer;
 use rocket::serde::{Serialize, json::Json};
@@ -20,7 +21,7 @@ macro_rules! debugMessage {
 }
 
 // TODO: Implement concurrent requests to increase performance
-// const CONCURRENT_INDEXING_AMOUNT: usize = 10; // How many network requests to make at once when indexing
+const CONCURRENT_INDEXING_AMOUNT: u16 = 10; // How many network requests to make at once when indexing
 
 #[macro_use] extern crate rocket;
 
@@ -163,43 +164,98 @@ async fn index_web(mut connection: PoolConnection<Sqlite>) {
 async fn index_staged_sites(mut connection: PoolConnection<Sqlite>) {
     // Get the first 100 sites from the staging table and remove them from the staging table.
     // Then, index them.
-    let mut rows = sqlx::query("SELECT * FROM staging LIMIT 100;")
+    let mut rows = sqlx::query("SELECT * FROM staging LIMIT ?;")
+        .bind(CONCURRENT_INDEXING_AMOUNT)
         .fetch_all(&mut connection)
         .await
         .unwrap();
 
     let mut are_staged_sites: bool = true;
 
-    let mut sites_scanned: u64 = 0;
+    let sites_scanned: Arc<Mutex<u64>> = Arc::new(Mutex::new(0));
+    let total_sites_scanned: Arc<Mutex<u64>> = Arc::new(Mutex::new(0));
 
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .redirect(reqwest::redirect::Policy::limited(15))
+        .user_agent("RustSearchEngineCrawler/1.0; (+https://github.com/Glitch752/rust-search-engine)")
+        .build()
+        .unwrap();
 
     while are_staged_sites {
         // Remove the sites from the staging table.
-        for row in &rows {
-            let url: String = row.get("url");
-            debugMessage!("{}", url);
-            // Make sure we don't move connection so it can be used in the next iteration of the loop.
-            sqlx::query("DELETE FROM staging WHERE url = ?;")
-                .bind(url.clone())
-                .execute(&mut connection)
-                .await
-                .unwrap();
+        let urls: Vec<String> = rows.iter().map(|row| row.try_get::<&str, &str>("url").unwrap_or("Unknown").to_string()).collect();
 
-            debugMessage!("Removed {} from the staging table.", url);
+        let url_sql: String = urls.iter().map(|url| format!("'{}'", url)).collect::<Vec<String>>().join(", ");
+        println!("({})", url_sql);
 
-            index_site(url.as_str(), &mut connection, &client).await;
+        // TODO: This could potentially create a SQL injection vulnerability with the right URL, but .bind doesn't work with IN.
+        //       Possibly because .bind adds quotes around a string and IN takes it as a single string instead of multiple strings?
+        let amount: usize = sqlx::query(format!("DELETE FROM staging WHERE url IN ({});", url_sql).as_str())
+            .execute(&mut connection)
+            .await
+            .unwrap()
+            .rows_affected() as usize;
 
-            debugMessage!("Indexed {}.", url);
+        debugMessage!("Removed {} sites from the staging table.", amount);
 
-            sites_scanned += 1;
-            debugMessage!("Sites scanned: {}", sites_scanned);
-        }
+        // Download the sites concurrently.
+        let bodies = stream::iter(urls)
+            .map(|url| {
+                let client = &client;
+                async move {
+                    let resp = client.get(url.clone()).send().await?;
+                    Ok::<(String, reqwest::Response), reqwest::Error>((url, resp))
+                }
+            })
+            .buffer_unordered(CONCURRENT_INDEXING_AMOUNT as usize);
 
-        debugMessage!("Finished indexing set of 100 staged sites.");
+        // Temporarily put connection into a Mutex so we can use it in the async block.
+        let new_connection = Arc::new(tokio::sync::Mutex::new(&mut connection));
+
+        bodies
+            .for_each(|b: Result<(String, reqwest::Response), reqwest::Error>| async {
+                match b {
+                    Ok(b) => {
+                        let url: String = b.0;
+                        let body: reqwest::Response = b.1;
+
+                        // Add 1 to the sites scanned (sites_scanned is an Arc<Mutex<u64>>).
+                        *sites_scanned.lock().unwrap() += 1;
+
+                        // Add 1 to the total sites scanned (total_sites_scanned is an Arc<Mutex<u64>>).
+                        *total_sites_scanned.lock().unwrap() += 1;
+                        
+                        debugMessage!("Downloaded {}: {}/{} concurrent requests completed. Total sites scanned: {}", url, *sites_scanned.lock().unwrap(), CONCURRENT_INDEXING_AMOUNT, *total_sites_scanned.lock().unwrap());
+                        
+                        let retry: bool = index_site(url.as_str(), body, new_connection.lock().await).await;
+
+                        if retry {
+                            // Add the site back to the staging table.
+                            sqlx::query("INSERT INTO staging (url) VALUES (?);")
+                                .bind(url.clone())
+                                .execute(&mut new_connection.lock().await as &mut PoolConnection<Sqlite>)
+                                .await
+                                .unwrap();
+                            debugMessage!("Added {} back to the staging table.", url);
+                        }
+
+                        debugMessage!("Indexed {}.", url);
+                    },
+                    Err(ref e) => {
+                        debugMessage!("Found an error when indexing site: {}", e);
+                    },
+                }
+            })
+            .await;
+
+        *sites_scanned.lock().unwrap() = 0;
+
+        debugMessage!("Finished indexing set of {} staged sites.", CONCURRENT_INDEXING_AMOUNT);
 
         // Check if there are any more sites in the staging table.
-        rows = sqlx::query("SELECT * FROM staging LIMIT 100;")
+        rows = sqlx::query("SELECT * FROM staging LIMIT ?;")
+            .bind(CONCURRENT_INDEXING_AMOUNT)
             .fetch_all(&mut connection)
             .await
             .unwrap();
@@ -214,32 +270,28 @@ async fn index_staged_sites(mut connection: PoolConnection<Sqlite>) {
     println!("Done indexing the web! This probably shouldn't have been called unless this was left running for a rediculous amount of time or something went wrong.");
 }
 
-async fn index_site(url: &str, connection: &mut PoolConnection<Sqlite>, client: &Client) {
+// The return value of this function determines whether we should retry the request or not.
+async fn index_site(url: &str, body: reqwest::Response, mut connection: tokio::sync::MutexGuard<'_, &mut PoolConnection<Sqlite>>) -> bool {
     // 1. Download the site.
     // Use reqwest to download the site.
-    println!("Downloading {}...", url);
-
-    // Make sure that we can get the site, even if it's a redirect.
-    let body = client.get(url).send().await;
-
-    debugMessage!("Downloaded {}", url);
-
-    if body.is_err() {
-        debugMessage!("Error downloading site: {}. Continuing to next site.", url);
-        return;
-    }
-
-    let body = body.unwrap();
 
     if !body.status().is_success() {
+        // Check if the status code is 429, and find out how long we should wait before trying again.
+        if body.status().as_u16() == 429 {
+            let retry_after: u64 = body.headers().get("Retry-After").unwrap().to_str().unwrap().parse().unwrap();
+            debugMessage!("Got a 429 from {}, retrying in {} seconds.", url, retry_after);
+            tokio::time::sleep(Duration::from_secs(retry_after)).await;
+            return true;
+        }
+
         debugMessage!("Error downloading site: {}. Response code: {}. Continuing to next site.", url, body.status().as_str());
-        return;
+        return false;
     }
     
     // Make sure the result is a website and not a different file format.
     if !body.headers().get("content-type").unwrap().to_str().unwrap().contains("text/html") {
         debugMessage!("{} is not a website. Continuing to next site.", url);
-        return;
+        return false;
     }
 
     let (title, keywords, rank, links): (String, String, i32, Vec<String>) = {
@@ -247,7 +299,7 @@ async fn index_site(url: &str, connection: &mut PoolConnection<Sqlite>, client: 
 
         if text.is_err() {
             debugMessage!("Error getting text from site: {}. Continuing to next site.", url);
-            return;
+            return false;
         }
 
         let text: String = text.unwrap();
@@ -302,38 +354,44 @@ async fn index_site(url: &str, connection: &mut PoolConnection<Sqlite>, client: 
     };
 
     // 6. Add the site to the sitedata table.
-    sqlx::query("INSERT INTO sitedata (url, title, keywords, rank) VALUES (?, ?, ?, ?);")
+    let result = sqlx::query("INSERT INTO sitedata (url, title, keywords, rank) VALUES (?, ?, ?, ?);")
         .bind(url)
         .bind(title)
         .bind(keywords)
         .bind(rank)
-        .execute(&mut *connection)
-        .await
-        .unwrap();
+        .execute(&mut connection as &mut PoolConnection<Sqlite>)
+        .await;
+
+    if result.is_err() {
+        debugMessage!("Error adding {} to sitedata table: {}", url, result.err().unwrap());
+        return false;
+    }
 
     debugMessage!("Inserting new links into the staging table.");
 
     for link in links {
         let rows = sqlx::query("SELECT * FROM staging WHERE url = ?;")
             .bind(link.clone())
-            .fetch_all(&mut *connection)
+            .fetch_all(&mut connection as &mut PoolConnection<Sqlite>)
             .await
             .unwrap();
         if rows.is_empty() {
             let rows = sqlx::query("SELECT * FROM sitedata WHERE url = ?;")
                 .bind(link.clone())
-                .fetch_all(&mut *connection)
+                .fetch_all(&mut connection as &mut PoolConnection<Sqlite>)
                 .await
                 .unwrap();
             if rows.is_empty() {
                 sqlx::query("INSERT INTO staging (url) VALUES (?);")
                     .bind(link)
-                    .execute(&mut *connection)
+                    .execute(&mut connection as &mut PoolConnection<Sqlite>)
                     .await
                     .unwrap();
             }
         }
     }
+
+    return false;
 }
 
 fn parse_relative_url(base_url: &str, relative_url: &str) -> String {
