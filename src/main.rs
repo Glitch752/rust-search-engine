@@ -1,5 +1,6 @@
 use std::{time::Duration, sync::{Arc, Mutex}};
 
+use reqwest::header::HeaderValue;
 use rocket::{tokio, futures::{stream, StreamExt}};
 use rocket::fairing::AdHoc;
 use rocket::fs::FileServer;
@@ -138,7 +139,13 @@ async fn index_web(mut connection: PoolConnection<Sqlite>) {
         .unwrap();
     debugMessage!("Sitedata table created if it didn't exist.");
 
-    let default_site: String = "https://github.com/".to_string();
+    let default_site: String;
+
+    if std::env::args().any(|x| x == "--default-site") {
+        default_site = std::env::args().nth(std::env::args().position(|x| x == "--default-site").unwrap() + 1).unwrap();
+    } else {
+        default_site = "https://github.com/".to_string();
+    }
 
     // Check if there are any sites in the sitedata table. If not, this is the first time we've started to index the web.
     // If there are sites, then we can skip adding the default site to the staging table.
@@ -267,7 +274,7 @@ async fn index_staged_sites(mut connection: PoolConnection<Sqlite>) {
     }
 
     // We're done indexing the web!
-    println!("Done indexing the web! This probably shouldn't have been called unless this was left running for a rediculous amount of time or something went wrong.");
+    println!("Done indexing the web! This probably shouldn't have been called unless this was left running for a ridiculous amount of time or something went wrong.");
 }
 
 // The return value of this function determines whether we should retry the request or not.
@@ -278,7 +285,14 @@ async fn index_site(url: &str, body: reqwest::Response, mut connection: tokio::s
     if !body.status().is_success() {
         // Check if the status code is 429, and find out how long we should wait before trying again.
         if body.status().as_u16() == 429 {
-            let retry_after: u64 = body.headers().get("Retry-After").unwrap().to_str().unwrap().parse().unwrap();
+            let retry_after_header: Option<&HeaderValue> = body.headers().get("Retry-After");
+            let retry_after: u64;
+            if retry_after_header.is_none() {
+                retry_after = 60;
+            } else {
+                retry_after = retry_after_header.unwrap().to_str().unwrap_or("60").parse().unwrap_or(60);
+            }
+
             debugMessage!("Got a 429 from {}, retrying in {} seconds.", url, retry_after);
             tokio::time::sleep(Duration::from_secs(retry_after)).await;
             return true;
