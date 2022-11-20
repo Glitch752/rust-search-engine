@@ -60,10 +60,44 @@ struct SearchResults {
     count: u32
 }
 
+#[derive(Serialize)]
+struct SiteInformation {
+    title: String,
+    keywords: Vec<String>,
+    rank: u32
+}
+
+#[get("/siteInformation?<url>")]
+async fn site_information(mut db: Connection<Sites>, url: String) -> Json<SiteInformation> {
+    let information: Result<SqliteRow, _> = sqlx::query("SELECT title, keywords, rank FROM sitedata WHERE url = ?")
+        .bind(url)
+        .fetch_one(&mut *db)
+        .await;
+
+    let information = match information {
+        Ok(information) => information,
+        Err(_) => {
+            return Json(SiteInformation {
+                title: "".to_string(),
+                keywords: vec![],
+                rank: 0
+            })
+        }
+    };
+
+    let site_information: SiteInformation = SiteInformation {
+        title: information.get::<&str, &str>("title").to_string(),
+        keywords: information.get::<&str, &str>("keywords").to_string().split(",").map(|x| x.to_string()).collect(),
+        rank: information.get::<u32, &str>("rank")
+    };
+
+    Json(site_information)
+}
+
 #[get("/search?<query>&<page>")]
 async fn search(mut db: Connection<Sites>, query: String, page: u32) -> Json<SearchResults> {
     // Get sites from the database with similar titles
-    let sites: Vec<SqliteRow> = sqlx::query("SELECT title, url FROM sitedata WHERE title LIKE ? ESCAPE '\\' LIMIT 30 OFFSET ?")
+    let sites: Vec<SqliteRow> = sqlx::query("SELECT title, url FROM sitedata WHERE title LIKE ? ESCAPE '\\' ORDER BY rank DESC LIMIT 30 OFFSET ?")
         .bind(format!("%{}%", query))
         .bind((page - 1) * 30)
         .fetch_all(&mut *db)
@@ -99,7 +133,7 @@ fn recommended(query: Option<&str>) -> Json<Vec<Recommendation<String>>> {
 async fn main() {
     let _ = rocket::build()
         .mount("/", FileServer::from("./public"))
-        .mount("/api", routes![recommended, search])
+        .mount("/api", routes![recommended, search, site_information])
         .attach(Sites::init())
         .attach(AdHoc::on_liftoff("Index web", |rocket| Box::pin(async move {
             if std::env::args().any(|x| x == "--no-index") {
@@ -197,7 +231,6 @@ async fn index_staged_sites(mut connection: PoolConnection<Sqlite>) {
         }).collect();
 
         let url_sql: String = sites.iter().map(|(url, _)| format!("'{}'", url)).collect::<Vec<String>>().join(", ");
-        println!("({})", url_sql);
 
         // TODO: This could potentially create a SQL injection vulnerability with the right URL, but .bind doesn't work with IN.
         //       Possibly because .bind adds quotes around a string and IN takes it as a single string instead of multiple strings?
@@ -406,7 +439,6 @@ async fn index_site(url: &str, rank: u32, body: reqwest::Response, mut connectio
                     .await
                     .unwrap();
             } else {
-                debugMessage!("{} is already in the sitedata table.", link);
                 // Increase the rank of the site by 1.
                 sqlx::query("UPDATE sitedata SET rank = rank + 1 WHERE url = ?;")
                     .bind(link)
@@ -415,7 +447,6 @@ async fn index_site(url: &str, rank: u32, body: reqwest::Response, mut connectio
                     .unwrap();
             }
         } else {
-            debugMessage!("{} is already in the staging table.", link);
             // Increase the temprank of the staged site by 1.
             sqlx::query("UPDATE staging SET temprank = temprank + 1 WHERE url = ?;")
                 .bind(link)
