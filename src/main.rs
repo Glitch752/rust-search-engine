@@ -150,6 +150,12 @@ async fn main() {
         .launch().await;
 }
 
+enum IndexResult {
+    Indexed,
+    RetryLater,
+    DoNotIndex,
+}
+
 async fn index_web(mut connection: PoolConnection<Sqlite>) {
     println!("Indexing web...");
     // Look into the database 'sites' and find the staging table.
@@ -172,6 +178,13 @@ async fn index_web(mut connection: PoolConnection<Sqlite>) {
         .await
         .unwrap();
     debugMessage!("Sitedata table created if it didn't exist.");
+
+    // Create the donotindex table if it doesn't exist.
+    // This table has a url (text) as the primary key.
+    sqlx::query("CREATE TABLE IF NOT EXISTS donotindex (url TEXT PRIMARY KEY);")
+        .execute(&mut connection)
+        .await
+        .unwrap();
 
     let default_site: String;
 
@@ -272,20 +285,32 @@ async fn index_staged_sites(mut connection: PoolConnection<Sqlite>) {
                         
                         debugMessage!("Downloaded {}: {}/{} concurrent requests completed. Total sites scanned: {}", url, *sites_scanned.lock().unwrap(), CONCURRENT_INDEXING_AMOUNT, *total_sites_scanned.lock().unwrap());
                         
-                        let retry: bool = index_site(url.as_str(), rank, body, new_connection.lock().await).await;
+                        let retry: IndexResult = index_site(url.as_str(), rank, body, new_connection.lock().await).await;
 
-                        if retry {
-                            // Add the site back to the staging table.
-                            sqlx::query("INSERT INTO staging (url, temprank) VALUES (?, ?);")
-                                .bind(url.clone())
-                                .bind(rank)
-                                .execute(&mut new_connection.lock().await as &mut PoolConnection<Sqlite>)
-                                .await
-                                .unwrap();
-                            debugMessage!("Added {} back to the staging table.", url);
+                        match retry {
+                            IndexResult::RetryLater => {
+                                // Add the site back to the staging table.
+                                sqlx::query("INSERT INTO staging (url, temprank) VALUES (?, ?);")
+                                    .bind(url.clone())
+                                    .bind(rank)
+                                    .execute(&mut new_connection.lock().await as &mut PoolConnection<Sqlite>)
+                                    .await
+                                    .unwrap();
+                                debugMessage!("Added {} back to the staging table.", url);
+                            }
+                            IndexResult::DoNotIndex => {
+                                // Add the site to the donotindex table.
+                                sqlx::query("INSERT INTO donotindex (url) VALUES (?);")
+                                    .bind(url.clone())
+                                    .execute(&mut new_connection.lock().await as &mut PoolConnection<Sqlite>)
+                                    .await
+                                    .unwrap();
+                                debugMessage!("Added {} to the donotindex table.", url);
+                            }
+                            IndexResult::Indexed => {
+                                debugMessage!("Indexed {}.", url);
+                            }
                         }
-
-                        debugMessage!("Indexed {}.", url);
                     },
                     Err(ref e) => {
                         debugMessage!("Found an error when indexing site: {}", e);
@@ -316,7 +341,7 @@ async fn index_staged_sites(mut connection: PoolConnection<Sqlite>) {
 }
 
 // The return value of this function determines whether we should retry the request or not.
-async fn index_site(url: &str, rank: u32, body: reqwest::Response, mut connection: tokio::sync::MutexGuard<'_, &mut PoolConnection<Sqlite>>) -> bool {
+async fn index_site(url: &str, rank: u32, body: reqwest::Response, mut connection: tokio::sync::MutexGuard<'_, &mut PoolConnection<Sqlite>>) -> IndexResult {
     // 1. Download the site.
     // Use reqwest to download the site.
 
@@ -333,11 +358,11 @@ async fn index_site(url: &str, rank: u32, body: reqwest::Response, mut connectio
 
             debugMessage!("Got a 429 from {}, retrying in {} seconds.", url, retry_after);
             tokio::time::sleep(Duration::from_secs(retry_after)).await;
-            return true;
+            return IndexResult::RetryLater;
         }
 
         debugMessage!("Error downloading site: {}. Response code: {}. Continuing to next site.", url, body.status().as_str());
-        return false;
+        return IndexResult::DoNotIndex;
     }
     
     // Make sure the result is a website and not a different file format.
@@ -345,12 +370,12 @@ async fn index_site(url: &str, rank: u32, body: reqwest::Response, mut connectio
 
     if content_type.is_none() {
         debugMessage!("No content type header for {}. Continuing to next site.", url);
-        return false;
+        return IndexResult::DoNotIndex;
     }
 
     if !content_type.unwrap().to_str().unwrap_or("").contains("text/html") {
         debugMessage!("{} is not a website. Continuing to next site.", url);
-        return false;
+        return IndexResult::DoNotIndex;
     }
 
     let (title, keywords, links): (String, String, Vec<String>) = {
@@ -358,7 +383,7 @@ async fn index_site(url: &str, rank: u32, body: reqwest::Response, mut connectio
 
         if text.is_err() {
             debugMessage!("Error getting text from site: {}. Continuing to next site.", url);
-            return false;
+            return IndexResult::DoNotIndex;
         }
 
         let text: String = text.unwrap();
@@ -422,7 +447,7 @@ async fn index_site(url: &str, rank: u32, body: reqwest::Response, mut connectio
 
     if result.is_err() {
         debugMessage!("Error adding {} to sitedata table: {}", url, result.err().unwrap());
-        return false;
+        return IndexResult::DoNotIndex;
     }
 
     debugMessage!("Inserting new links into the staging table.");
@@ -463,7 +488,7 @@ async fn index_site(url: &str, rank: u32, body: reqwest::Response, mut connectio
         }
     }
 
-    return false;
+    return IndexResult::Indexed;
 }
 
 fn parse_relative_url(base_url: &str, relative_url: &str) -> String {
