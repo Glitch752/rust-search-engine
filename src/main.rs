@@ -341,7 +341,14 @@ async fn index_site(url: &str, rank: u32, body: reqwest::Response, mut connectio
     }
     
     // Make sure the result is a website and not a different file format.
-    if !body.headers().get("content-type").unwrap().to_str().unwrap().contains("text/html") {
+    let content_type: Option<&HeaderValue> = body.headers().get("Content-Type");
+
+    if content_type.is_none() {
+        debugMessage!("No content type header for {}. Continuing to next site.", url);
+        return false;
+    }
+
+    if !content_type.unwrap().to_str().unwrap_or("").contains("text/html") {
         debugMessage!("{} is not a website. Continuing to next site.", url);
         return false;
     }
