@@ -230,7 +230,7 @@ async fn index_staged_sites(mut connection: PoolConnection<Sqlite>) {
              row.try_get::<u32, &str>("temprank").unwrap_or(0))
         }).collect();
 
-        let url_sql: String = sites.iter().map(|(url, _)| format!("'{}'", url)).collect::<Vec<String>>().join(", ");
+        let url_sql: String = sites.iter().map(|(url, _)| format!("'{}'", url.replace("'", "''"))).collect::<Vec<String>>().join(", ");
 
         // TODO: This could potentially create a SQL injection vulnerability with the right URL, but .bind doesn't work with IN.
         //       Possibly because .bind adds quotes around a string and IN takes it as a single string instead of multiple strings?
