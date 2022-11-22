@@ -1,7 +1,5 @@
 // TODO:
-// Implement rel="nofollow" for links
 // Implement meta name="robots"
-// Implement robots.txt
 // Implement sitemap.xml
 // Implement link rel="canonical"
 // Implement header X-Robots-Tag
@@ -473,7 +471,7 @@ async fn index_site(url: &str, rank: u32, body: reqwest::Response, mut connectio
         return IndexResult::DoNotIndex;
     }
 
-    let (title, keywords, links): (String, String, Vec<String>) = {
+    let (title, keywords, links): (String, String, Vec<(String, bool)>) = {
         let text = body.text().await;
 
         if text.is_err() {
@@ -513,20 +511,30 @@ async fn index_site(url: &str, rank: u32, body: reqwest::Response, mut connectio
         };
 
         // 5. Add links to the staging table if they aren't already in the staging table or the sitedata table.
-        let links: Vec<String> = document.select(&Selector::parse("a").unwrap()).map(|link| {
+        let links: Vec<(String, bool)> = document.select(&Selector::parse("a").unwrap()).map(|link| {
+            let mut should_impact_ranking: bool = true;
+            // Check if the link has rel="nofollow" or rel="external" or rel="ugc" or rel="sponsored". If so,
+            // don't impact the ranking of the linked site.
+            let rel: Option<&str> = link.value().attr("rel");
+            if rel.is_some() {
+                let rel: &str = rel.unwrap();
+                if rel.contains("nofollow") || rel.contains("ugc") || rel.contains("sponsored") {
+                    should_impact_ranking = false;
+                }
+            }
             let value: &str = link.value().attr("href").unwrap_or("");
             let absolute_url: String = parse_relative_url(url, value);
-            absolute_url
+            (absolute_url, should_impact_ranking)
         }).collect();
         
-        let links: Vec<String> = links.iter().filter(|link| {
-            !link.is_empty()
+        let links: Vec<(String, bool)> = links.iter().filter(|link| {
+            !link.0.is_empty()
         }).map(|link| {
-            link.to_string()
+            (link.0.to_string(), link.1)
         }).collect();
 
         // Deduplicate the links.
-        let links: Vec<String> = links.iter().cloned().collect::<HashSet<String>>().into_iter().collect();
+        let links: Vec<(String, bool)> = links.iter().cloned().collect::<HashSet<(String, bool)>>().into_iter().collect();
 
         (title, keywords, links)
     };
@@ -549,40 +557,46 @@ async fn index_site(url: &str, rank: u32, body: reqwest::Response, mut connectio
 
     for link in links {
         let rows = sqlx::query("SELECT * FROM donotindex WHERE url = ?;")
-            .bind(link.as_str())
+            .bind(link.0.as_str())
             .fetch_all(&mut connection as &mut PoolConnection<Sqlite>)
             .await
             .unwrap();
         if rows.is_empty() {
             let rows = sqlx::query("SELECT * FROM staging WHERE url = ?;")
-                .bind(link.clone())
+                .bind(link.0.clone())
                 .fetch_all(&mut connection as &mut PoolConnection<Sqlite>)
                 .await
                 .unwrap();
             if rows.is_empty() {
                 let rows = sqlx::query("SELECT * FROM sitedata WHERE url = ?;")
-                    .bind(link.clone())
+                    .bind(link.0.clone())
                     .fetch_all(&mut connection as &mut PoolConnection<Sqlite>)
                     .await
                     .unwrap();
                 if rows.is_empty() {
                     sqlx::query("INSERT INTO staging (url) VALUES (?);")
-                        .bind(link)
+                        .bind(link.0)
                         .execute(&mut connection as &mut PoolConnection<Sqlite>)
                         .await
                         .unwrap();
                 } else {
+                    if !link.1 {
+                        continue;
+                    }
                     // Increase the rank of the site by 1.
                     sqlx::query("UPDATE sitedata SET rank = rank + 1 WHERE url = ?;")
-                        .bind(link)
+                        .bind(link.0)
                         .execute(&mut connection as &mut PoolConnection<Sqlite>)
                         .await
                         .unwrap();
                 }
             } else {
+                if !link.1 {
+                    continue;
+                }
                 // Increase the temprank of the staged site by 1.
                 sqlx::query("UPDATE staging SET temprank = temprank + 1 WHERE url = ?;")
-                    .bind(link)
+                    .bind(link.0)
                     .execute(&mut connection as &mut PoolConnection<Sqlite>)
                     .await
                     .unwrap();
