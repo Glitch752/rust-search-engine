@@ -1,4 +1,13 @@
-use std::{time::Duration, sync::{Arc, Mutex}, collections::HashSet};
+// TODO:
+// Implement rel="nofollow" for links
+// Implement meta name="robots"
+// Implement robots.txt
+// Implement sitemap.xml
+// Implement link rel="canonical"
+// Implement header X-Robots-Tag
+// Swap between different hosts so we don't spam a single site repeatedly. Ideally, we would only send a request to each site every 1-2 seconds.
+
+use std::{time::{Duration, SystemTime}, sync::{Arc, Mutex}, collections::HashSet};
 
 use reqwest::header::HeaderValue;
 use rocket::{tokio, futures::{stream, StreamExt}};
@@ -7,6 +16,8 @@ use rocket::fs::FileServer;
 use rocket::serde::{Serialize, json::Json};
 
 use scraper::{Html, Selector, ElementRef};
+
+use robots_txt::{Robots, matcher::SimpleMatcher};
 
 // Runs prinln!() with all the arguments if the debug flag is passed on the command line.
 // This function can take as many arguments as needed.
@@ -23,6 +34,7 @@ macro_rules! debugMessage {
 
 // TODO: Implement concurrent requests to increase performance
 const CONCURRENT_INDEXING_AMOUNT: u16 = 10; // How many network requests to make at once when indexing
+const USER_AGENT: &str = "RustSearchEngineCrawler/0.1.1; (+https://github.com/Glitch752/rust-search-engine)"; // User agent to use when crawling
 
 #[macro_use] extern crate rocket;
 
@@ -154,6 +166,20 @@ enum IndexResult {
     Indexed,
     RetryLater,
     DoNotIndex,
+    Unknown
+}
+
+impl IndexResult {
+    fn is_unknown(&self) -> bool {
+        match self {
+            IndexResult::Unknown => true,
+            _ => false
+        }
+    }
+}
+
+fn index_robots_txt() -> bool {
+    return !std::env::args().any(|x| x == "--no-robots-txt");
 }
 
 async fn index_web(mut connection: PoolConnection<Sqlite>) {
@@ -182,6 +208,13 @@ async fn index_web(mut connection: PoolConnection<Sqlite>) {
     // Create the donotindex table if it doesn't exist.
     // This table has a url (text) as the primary key.
     sqlx::query("CREATE TABLE IF NOT EXISTS donotindex (url TEXT PRIMARY KEY);")
+        .execute(&mut connection)
+        .await
+        .unwrap();
+
+    // Create the robotstxt table if it doesn't exist.
+    // This table has a url (text) as the primary key, a text field for the content of the robots.txt file, and a timestamp for when it was first added.
+    sqlx::query("CREATE TABLE IF NOT EXISTS robotstxt (url TEXT PRIMARY KEY, content TEXT, firstadded INTEGER);")
         .execute(&mut connection)
         .await
         .unwrap();
@@ -232,7 +265,7 @@ async fn index_staged_sites(mut connection: PoolConnection<Sqlite>) {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
         .redirect(reqwest::redirect::Policy::limited(15))
-        .user_agent("RustSearchEngineCrawler/1.0; (+https://github.com/Glitch752/rust-search-engine)")
+        .user_agent(USER_AGENT)
         .build()
         .unwrap();
 
@@ -285,7 +318,68 @@ async fn index_staged_sites(mut connection: PoolConnection<Sqlite>) {
                         
                         debugMessage!("Downloaded {}: {}/{} concurrent requests completed. Total sites scanned: {}", url, *sites_scanned.lock().unwrap(), CONCURRENT_INDEXING_AMOUNT, *total_sites_scanned.lock().unwrap());
                         
-                        let retry: IndexResult = index_site(url.as_str(), rank, body, new_connection.lock().await).await;
+                        let mut retry: IndexResult = IndexResult::Unknown;
+
+                        let base_url: String = url.split("/").collect::<Vec<&str>>()[..3].join("/");
+
+                        println!("{}", base_url);
+
+                        'robotstxt: { if index_robots_txt() {
+                            // Check if the site already has a cached robots.txt file.
+                            let robots_txt: Option<String> = sqlx::query("SELECT content FROM robotstxt WHERE url = ?;")
+                                .bind(base_url.clone())
+                                .fetch_one(&mut new_connection.lock().await as &mut PoolConnection<Sqlite>)
+                                .await
+                                .ok()
+                                .map(|row| row.try_get::<&str, &str>("content").unwrap_or("Unknown").to_string());
+    
+                            // If the site doesn't have a cached robots.txt file, download it.
+                            let robots_txt: String = match robots_txt {
+                                Some(robots_txt) => robots_txt,
+                                None => {
+                                    let robots_txt_url: String = format!("{}/robots.txt", base_url.clone());
+    
+                                    let resp = client.get(robots_txt_url.clone()).send().await;
+
+                                    let resp = match resp {
+                                        Ok(resp) => resp,
+                                        Err(_) => {
+                                            break 'robotstxt;
+                                        }
+                                    };
+    
+                                    let robots_txt: String = resp.text().await.unwrap();
+    
+                                    // Add the robots.txt file to the robotstxt table.
+                                    sqlx::query("INSERT INTO robotstxt (url, content, firstadded) VALUES (?, ?, ?);")
+                                        .bind(base_url.clone())
+                                        .bind(robots_txt.clone())
+                                        .bind(SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as u32)
+                                        .execute(&mut new_connection.lock().await as &mut PoolConnection<Sqlite>)
+                                        .await
+                                        .unwrap();
+    
+                                    debugMessage!("Added {} to the robotstxt table.", base_url.clone());
+    
+                                    robots_txt
+                                }
+                            };
+    
+                            // Check if the site is allowed to be crawled.
+                            let robots = Robots::from_str_lossy(&robots_txt);
+                            
+                            let matcher = SimpleMatcher::new(&robots.choose_section(USER_AGENT).rules);
+    
+                            if !matcher.check_path(base_url.as_str()) {
+                                // The URL is not allowed to be crawled.
+                                println!("{} is not allowed to be crawled.", url);
+                                retry = IndexResult::DoNotIndex;
+                            }
+                        } };
+
+                        if retry.is_unknown() {
+                            retry = index_site(url.as_str(), rank, body, new_connection.lock().await).await;
+                        }
 
                         match retry {
                             IndexResult::RetryLater => {
@@ -309,6 +403,9 @@ async fn index_staged_sites(mut connection: PoolConnection<Sqlite>) {
                             }
                             IndexResult::Indexed => {
                                 debugMessage!("Indexed {}.", url);
+                            }
+                            IndexResult::Unknown => {
+                                debugMessage!("Unknown result for {}.", url);
                             }
                         }
                     },
