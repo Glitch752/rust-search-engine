@@ -322,8 +322,6 @@ async fn index_staged_sites(mut connection: PoolConnection<Sqlite>) {
 
                         let base_url: String = url.split("/").collect::<Vec<&str>>()[..3].join("/");
 
-                        println!("{}", base_url);
-
                         'robotstxt: { if index_robots_txt() {
                             // Check if the site already has a cached robots.txt file.
                             let robots_txt: Option<String> = sqlx::query("SELECT content FROM robotstxt WHERE url = ?;")
@@ -550,38 +548,45 @@ async fn index_site(url: &str, rank: u32, body: reqwest::Response, mut connectio
     debugMessage!("Inserting new links into the staging table.");
 
     for link in links {
-        let rows = sqlx::query("SELECT * FROM staging WHERE url = ?;")
-            .bind(link.clone())
+        let rows = sqlx::query("SELECT * FROM donotindex WHERE url = ?;")
+            .bind(link.as_str())
             .fetch_all(&mut connection as &mut PoolConnection<Sqlite>)
             .await
             .unwrap();
         if rows.is_empty() {
-            let rows = sqlx::query("SELECT * FROM sitedata WHERE url = ?;")
+            let rows = sqlx::query("SELECT * FROM staging WHERE url = ?;")
                 .bind(link.clone())
                 .fetch_all(&mut connection as &mut PoolConnection<Sqlite>)
                 .await
                 .unwrap();
             if rows.is_empty() {
-                sqlx::query("INSERT INTO staging (url) VALUES (?);")
-                    .bind(link)
-                    .execute(&mut connection as &mut PoolConnection<Sqlite>)
+                let rows = sqlx::query("SELECT * FROM sitedata WHERE url = ?;")
+                    .bind(link.clone())
+                    .fetch_all(&mut connection as &mut PoolConnection<Sqlite>)
                     .await
                     .unwrap();
+                if rows.is_empty() {
+                    sqlx::query("INSERT INTO staging (url) VALUES (?);")
+                        .bind(link)
+                        .execute(&mut connection as &mut PoolConnection<Sqlite>)
+                        .await
+                        .unwrap();
+                } else {
+                    // Increase the rank of the site by 1.
+                    sqlx::query("UPDATE sitedata SET rank = rank + 1 WHERE url = ?;")
+                        .bind(link)
+                        .execute(&mut connection as &mut PoolConnection<Sqlite>)
+                        .await
+                        .unwrap();
+                }
             } else {
-                // Increase the rank of the site by 1.
-                sqlx::query("UPDATE sitedata SET rank = rank + 1 WHERE url = ?;")
+                // Increase the temprank of the staged site by 1.
+                sqlx::query("UPDATE staging SET temprank = temprank + 1 WHERE url = ?;")
                     .bind(link)
                     .execute(&mut connection as &mut PoolConnection<Sqlite>)
                     .await
                     .unwrap();
             }
-        } else {
-            // Increase the temprank of the staged site by 1.
-            sqlx::query("UPDATE staging SET temprank = temprank + 1 WHERE url = ?;")
-                .bind(link)
-                .execute(&mut connection as &mut PoolConnection<Sqlite>)
-                .await
-                .unwrap();
         }
     }
 
