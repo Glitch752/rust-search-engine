@@ -396,14 +396,18 @@ async fn index_staged_sites(mut connection: PoolConnection<Sqlite>) {
                         match retry {
                             IndexResult::RetryLater => {
                                 // Add the site back to the staging table.
-                                sqlx::query("INSERT INTO staging (url, temprank, domain) VALUES (?, ?, ?);")
+                                let result = sqlx::query("INSERT INTO staging (url, temprank, domain) VALUES (?, ?, ?);")
                                     .bind(url.clone())
                                     .bind(rank)
                                     .bind(get_domain(url.as_str()))
                                     .execute(&mut new_connection.lock().await as &mut PoolConnection<Sqlite>)
-                                    .await
-                                    .unwrap();
-                                debugMessage!("Added {} back to the staging table.", url);
+                                    .await;
+
+                                if result.is_err() {
+                                    debugMessage!("Error adding {} back to the staging table: {}", url, result.err().unwrap());
+                                } else {
+                                    debugMessage!("Added {} back to the staging table.", url);
+                                }
                             }
                             IndexResult::DoNotIndex => {
                                 // Add the site to the donotindex table.
