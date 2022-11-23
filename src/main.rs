@@ -189,7 +189,12 @@ async fn index_web(mut connection: PoolConnection<Sqlite>) {
     // First, get the database connection from rocket.
     // Then, make sure the staging table exists.
 
-    sqlx::query("CREATE TABLE IF NOT EXISTS staging (url TEXT PRIMARY KEY, temprank INTEGER);")
+    if std::env::args().any(|x| x == "--purge-staging") {
+        println!("Purging staging table...");
+        let _ = sqlx::query("DELETE FROM staging").execute(&mut connection).await;
+    }
+
+    sqlx::query("CREATE TABLE IF NOT EXISTS staging (url TEXT PRIMARY KEY, temprank INTEGER, domain TEXT);")
         .execute(&mut connection)
         .await
         .unwrap();
@@ -227,15 +232,18 @@ async fn index_web(mut connection: PoolConnection<Sqlite>) {
 
     // Check if there are any sites in the sitedata table. If not, this is the first time we've started to index the web.
     // If there are sites, then we can skip adding the default site to the staging table.
-    let rows = sqlx::query("SELECT * FROM sitedata;")
-        .fetch_all(&mut connection)
+    let rows: u32 = sqlx::query("SELECT COUNT(*) FROM staging;")
+        .fetch_one(&mut connection)
         .await
-        .unwrap();
+        .unwrap()
+        .get(0);
 
-    if rows.is_empty() {
+    if rows == 0 {
         // Add the default site to the staging table.
-        sqlx::query("INSERT INTO staging (url) VALUES (?);")
+        sqlx::query("INSERT INTO staging (url, temprank, domain) VALUES (?, ?, ?);")
             .bind(default_site.clone())
+            .bind(0)
+            .bind(get_domain(&default_site))
             .execute(&mut connection)
             .await
             .unwrap();
@@ -247,9 +255,9 @@ async fn index_web(mut connection: PoolConnection<Sqlite>) {
 }
 
 async fn index_staged_sites(mut connection: PoolConnection<Sqlite>) {
-    // Get the first 100 sites from the staging table and remove them from the staging table.
-    // Then, index them.
-    let mut rows = sqlx::query("SELECT * FROM staging LIMIT ?;")
+    // Get the first CONCURRENT_INDEXING_AMOUNT of sites from the staging table.
+    // Every site should be a different domain (the domain column in the staging table).
+    let mut rows: Vec<SqliteRow> = sqlx::query("SELECT * FROM staging WHERE url IN (SELECT MIN(url) FROM staging GROUP BY domain) LIMIT ?;")
         .bind(CONCURRENT_INDEXING_AMOUNT)
         .fetch_all(&mut connection)
         .await
@@ -380,9 +388,10 @@ async fn index_staged_sites(mut connection: PoolConnection<Sqlite>) {
                         match retry {
                             IndexResult::RetryLater => {
                                 // Add the site back to the staging table.
-                                sqlx::query("INSERT INTO staging (url, temprank) VALUES (?, ?);")
+                                sqlx::query("INSERT INTO staging (url, temprank, domain) VALUES (?, ?, ?);")
                                     .bind(url.clone())
                                     .bind(rank)
+                                    .bind(get_domain(url.as_str()))
                                     .execute(&mut new_connection.lock().await as &mut PoolConnection<Sqlite>)
                                     .await
                                     .unwrap();
@@ -390,12 +399,16 @@ async fn index_staged_sites(mut connection: PoolConnection<Sqlite>) {
                             }
                             IndexResult::DoNotIndex => {
                                 // Add the site to the donotindex table.
-                                sqlx::query("INSERT INTO donotindex (url) VALUES (?);")
+                                let result = sqlx::query("INSERT INTO donotindex (url) VALUES (?);")
                                     .bind(url.clone())
                                     .execute(&mut new_connection.lock().await as &mut PoolConnection<Sqlite>)
-                                    .await
-                                    .unwrap();
-                                debugMessage!("Added {} to the donotindex table.", url);
+                                    .await;
+                                
+                                if result.is_ok() {
+                                    debugMessage!("Added {} to the donotindex table.", url);
+                                } else {
+                                    debugMessage!("Error adding {} to the donotindex table: {}", url, result.err().unwrap());
+                                }
                             }
                             IndexResult::Indexed => {
                                 debugMessage!("Indexed {}.", url);
@@ -417,7 +430,7 @@ async fn index_staged_sites(mut connection: PoolConnection<Sqlite>) {
         debugMessage!("Finished indexing set of {} staged sites.", CONCURRENT_INDEXING_AMOUNT);
 
         // Check if there are any more sites in the staging table.
-        rows = sqlx::query("SELECT * FROM staging LIMIT ?;")
+        rows = sqlx::query("SELECT * FROM staging WHERE url IN (SELECT MIN(url) FROM staging GROUP BY domain) LIMIT ?;")
             .bind(CONCURRENT_INDEXING_AMOUNT)
             .fetch_all(&mut connection)
             .await
@@ -574,8 +587,10 @@ async fn index_site(url: &str, rank: u32, body: reqwest::Response, mut connectio
                     .await
                     .unwrap();
                 if rows.is_empty() {
-                    sqlx::query("INSERT INTO staging (url) VALUES (?);")
-                        .bind(link.0)
+                    sqlx::query("INSERT INTO staging (url, temprank, domain) VALUES (?, ?, ?);")
+                        .bind(link.0.clone())
+                        .bind(0)
+                        .bind(get_domain(&link.0))
                         .execute(&mut connection as &mut PoolConnection<Sqlite>)
                         .await
                         .unwrap();
@@ -660,4 +675,14 @@ fn get_relative_url(base_url: &str, relative_url: &str) -> String {// TODO: Make
 
     // Otherwise, it doesn't have a base url.
     return format!("{}//{}/{}", base_url[0], base_url[2], &relative_url)
+}
+
+// This function takes in a string as a site and gives back the domain name,
+// not including the protocol, path, query parameters, or hash parameters.
+fn get_domain(path: &str) -> &str {
+    let path = path.split('/').collect::<Vec<&str>>();
+    if path.len() < 3 {
+        return "";
+    }
+    path[2]
 }
