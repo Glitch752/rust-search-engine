@@ -352,7 +352,15 @@ async fn index_staged_sites(mut connection: PoolConnection<Sqlite>) {
                                         }
                                     };
     
-                                    let robots_txt: String = resp.text().await.unwrap();
+                                    let robots_txt = resp.text().await;
+
+                                    let robots_txt = match robots_txt {
+                                        Ok(robots_txt) => robots_txt,
+                                        Err(err) => {
+                                            debugMessage!("Error downloading {}: {}", robots_txt_url, err);
+                                            break 'robotstxt;
+                                        }
+                                    };
     
                                     // Add the robots.txt file to the robotstxt table.
                                     sqlx::query("INSERT INTO robotstxt (url, content, firstadded) VALUES (?, ?, ?);")
